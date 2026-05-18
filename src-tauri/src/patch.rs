@@ -1,0 +1,442 @@
+use crate::{
+    backup,
+    diff::{ManifestDiff, RenamedFile, UpdatedFile},
+    error::{AppError, AppResult, msg},
+    hash::sha256_file,
+    manifest::{ManifestFile, Owner, PackManifest, Strategy, resolve_safe, write_manifest},
+    state,
+};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeSet, fs, path::Path, process::Command};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePlan {
+    pub from: String,
+    pub to: String,
+    pub added: Vec<FileAction>,
+    pub removed: Vec<FileAction>,
+    pub updated: Vec<FileAction>,
+    pub renamed: Vec<RenameAction>,
+    pub preserved: Vec<String>,
+    pub conflicts: Vec<Conflict>,
+    pub backup_candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAction {
+    pub path: String,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameAction {
+    pub from: String,
+    pub to: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conflict {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyResult {
+    pub backup_id: String,
+    pub plan: UpdatePlan,
+    pub state_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackResult {
+    pub backup_id: String,
+    pub restored_files: usize,
+    pub state_path: String,
+}
+
+pub fn build_plan(instance_dir: &Path, old_manifest: &PackManifest, new_manifest: &PackManifest, diff: &ManifestDiff) -> AppResult<UpdatePlan> {
+    validate_instance(instance_dir)?;
+    let mut plan = UpdatePlan {
+        from: old_manifest.version.clone(),
+        to: new_manifest.version.clone(),
+        added: Vec::new(),
+        removed: Vec::new(),
+        updated: Vec::new(),
+        renamed: Vec::new(),
+        preserved: Vec::new(),
+        conflicts: Vec::new(),
+        backup_candidates: Vec::new(),
+    };
+
+    for file in &diff.added {
+        if is_apply_managed(file) {
+            let target = resolve_safe(instance_dir, &file.path)?;
+            if target.exists() {
+                plan.conflicts.push(Conflict {
+                    path: file.path.clone(),
+                    reason: "用户实例中已存在同名文件，保留用户文件".to_string(),
+                });
+            } else {
+                plan.added.push(FileAction {
+                    path: file.path.clone(),
+                    sha256: Some(file.sha256.clone()),
+                });
+            }
+        } else {
+            plan.preserved.push(file.path.clone());
+        }
+    }
+
+    for file in &diff.removed {
+        handle_removed(instance_dir, file, &mut plan)?;
+    }
+
+    for UpdatedFile { old, new } in &diff.updated {
+        if is_apply_managed(old) && is_apply_managed(new) {
+            let target = resolve_safe(instance_dir, &old.path)?;
+            if !target.exists() {
+                plan.updated.push(FileAction {
+                    path: new.path.clone(),
+                    sha256: Some(new.sha256.clone()),
+                });
+                continue;
+            }
+            let current_hash = sha256_file(&target)?;
+            if current_hash == old.sha256 {
+                plan.backup_candidates.push(old.path.clone());
+                plan.updated.push(FileAction {
+                    path: new.path.clone(),
+                    sha256: Some(new.sha256.clone()),
+                });
+            } else {
+                plan.conflicts.push(Conflict {
+                    path: old.path.clone(),
+                    reason: "用户修改过官方文件，保留本地文件，新官方文件写入冲突目录".to_string(),
+                });
+            }
+        } else {
+            plan.preserved.push(new.path.clone());
+        }
+    }
+
+    for RenamedFile { old, new } in &diff.renamed {
+        if is_apply_managed(old) && is_apply_managed(new) {
+            let old_target = resolve_safe(instance_dir, &old.path)?;
+            let new_target = resolve_safe(instance_dir, &new.path)?;
+            if old_target.exists() && sha256_file(&old_target)? == old.sha256 && !new_target.exists() {
+                plan.backup_candidates.push(old.path.clone());
+                plan.renamed.push(RenameAction {
+                    from: old.path.clone(),
+                    to: new.path.clone(),
+                    sha256: new.sha256.clone(),
+                });
+            } else {
+                plan.conflicts.push(Conflict {
+                    path: old.path.clone(),
+                    reason: "重命名目标不安全或原文件已被用户修改".to_string(),
+                });
+            }
+        } else {
+            plan.preserved.push(new.path.clone());
+        }
+    }
+
+    dedupe(&mut plan.backup_candidates);
+    Ok(plan)
+}
+
+pub fn apply_update(instance_dir: &Path, _old_source: &Path, new_source: &Path, old_manifest: PackManifest, new_manifest: PackManifest) -> AppResult<ApplyResult> {
+    if minecraft_running() {
+        return msg("检测到 Minecraft/Java 游戏进程正在运行，请关闭游戏后再更新");
+    }
+
+    let diff = crate::diff::compare(&old_manifest, &new_manifest);
+    let mut plan = build_plan(instance_dir, &old_manifest, &new_manifest, &diff)?;
+    let manifest_sha = manifest_digest(&new_manifest)?;
+    let mut current_state = match state::read_state(instance_dir)? {
+        Some(existing) => existing,
+        None => state::build_state(&old_manifest, manifest_digest(&old_manifest)?),
+    };
+
+    let backup_id = backup::make_backup_id(&old_manifest.version, &new_manifest.version);
+    let mut backup_files = Vec::new();
+    for path in &plan.backup_candidates {
+        if let Some(file) = backup::copy_into_backup(instance_dir, &backup_id, path)? {
+            backup_files.push(file);
+        }
+    }
+    for action in plan.removed.iter().chain(plan.updated.iter()) {
+        if !plan.backup_candidates.iter().any(|p| p == &action.path) {
+            if let Some(file) = backup::copy_into_backup(instance_dir, &backup_id, &action.path)? {
+                backup_files.push(file);
+            }
+        }
+    }
+    backup::create_backup(instance_dir, &backup_id, &old_manifest.version, &new_manifest.version, backup_files, &current_state)?;
+
+    for action in &plan.removed {
+        let target = resolve_safe(instance_dir, &action.path)?;
+        if target.exists() {
+            fs::remove_file(target)?;
+        }
+    }
+
+    for action in &plan.renamed {
+        let from = resolve_safe(instance_dir, &action.from)?;
+        let to = resolve_safe(instance_dir, &action.to)?;
+        ensure_parent(&to)?;
+        fs::rename(from, to)?;
+    }
+
+    for update in &plan.updated {
+        copy_from_source(new_source, instance_dir, &update.path, update.sha256.as_deref())?;
+    }
+    for add in &plan.added {
+        copy_from_source(new_source, instance_dir, &add.path, add.sha256.as_deref())?;
+    }
+
+    for conflict in &plan.conflicts {
+        if let Some(new_file) = new_manifest.files.iter().find(|file| file.path == conflict.path) {
+            let conflict_root = instance_dir
+                .join(".packdelta")
+                .join("conflicts")
+                .join(format!("{}_to_{}", old_manifest.version, new_manifest.version));
+            copy_from_source(new_source, &conflict_root, &new_file.path, Some(&new_file.sha256))?;
+        }
+    }
+
+    write_manifest(
+        &instance_dir
+            .join(".packdelta")
+            .join("manifests")
+            .join(format!("{}.json", old_manifest.version)),
+        &old_manifest,
+    )?;
+    write_manifest(
+        &instance_dir
+            .join(".packdelta")
+            .join("manifests")
+            .join(format!("{}.json", new_manifest.version)),
+        &new_manifest,
+    )?;
+
+    current_state = state::build_state(&new_manifest, manifest_sha);
+    current_state.backups = state::read_state(instance_dir)?
+        .map(|state| state.backups)
+        .unwrap_or_default();
+    current_state.backups.push(state::backup_record(
+        backup_id.clone(),
+        old_manifest.version,
+        new_manifest.version,
+    ));
+    state::write_state(instance_dir, &current_state)?;
+    plan.conflicts.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(ApplyResult {
+        backup_id,
+        plan,
+        state_path: state::state_path(instance_dir).display().to_string(),
+    })
+}
+
+pub fn rollback(instance_dir: &Path, backup_id: &str) -> AppResult<RollbackResult> {
+    backup::write_rollback_safety(instance_dir, backup_id)?;
+    let backup_manifest = backup::read_backup_manifest(instance_dir, backup_id)?;
+    let state_before = backup::read_state_before(instance_dir, backup_id)?;
+    let current_state = state::read_state(instance_dir)?.unwrap_or_else(|| state_before.clone());
+
+    for path in current_state.managed_files.keys() {
+        if !state_before.managed_files.contains_key(path) {
+            let target = resolve_safe(instance_dir, path)?;
+            if target.exists() {
+                fs::remove_file(target)?;
+            }
+        }
+    }
+
+    for file in &backup_manifest.files {
+        let source = instance_dir
+            .join(".packdelta")
+            .join("backups")
+            .join(backup_id)
+            .join(file.backup_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let target = resolve_safe(instance_dir, &file.path)?;
+        ensure_parent(&target)?;
+        fs::copy(source, target)?;
+    }
+
+    state::write_state(instance_dir, &state_before)?;
+    fs::write(
+        instance_dir
+            .join(".packdelta")
+            .join("backups")
+            .join(backup_id)
+            .join("rollback.log"),
+        format!("rollback completed for {backup_id}\n"),
+    )?;
+
+    Ok(RollbackResult {
+        backup_id: backup_id.to_string(),
+        restored_files: backup_manifest.files.len(),
+        state_path: state::state_path(instance_dir).display().to_string(),
+    })
+}
+
+fn handle_removed(instance_dir: &Path, file: &ManifestFile, plan: &mut UpdatePlan) -> AppResult<()> {
+    if !is_apply_managed(file) {
+        plan.preserved.push(file.path.clone());
+        return Ok(());
+    }
+    let target = resolve_safe(instance_dir, &file.path)?;
+    if !target.exists() {
+        plan.removed.push(FileAction {
+            path: file.path.clone(),
+            sha256: Some(file.sha256.clone()),
+        });
+        return Ok(());
+    }
+    let current_hash = sha256_file(&target)?;
+    if current_hash == file.sha256 {
+        plan.backup_candidates.push(file.path.clone());
+        plan.removed.push(FileAction {
+            path: file.path.clone(),
+            sha256: Some(file.sha256.clone()),
+        });
+    } else {
+        plan.conflicts.push(Conflict {
+            path: file.path.clone(),
+            reason: "删除目标已被用户修改，保留本地文件".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn is_apply_managed(file: &ManifestFile) -> bool {
+    file.owner == Owner::Pack && matches!(file.strategy, Strategy::Replace | Strategy::Delete)
+}
+
+fn copy_from_source(source_root: &Path, target_root: &Path, relative_path: &str, expected_sha: Option<&str>) -> AppResult<()> {
+    let source = resolve_safe(source_root, relative_path)?;
+    if !source.exists() {
+        return Err(AppError::Message(format!("源文件不存在: {}", source.display())));
+    }
+    let actual_sha = sha256_file(&source)?;
+    if let Some(expected) = expected_sha {
+        if actual_sha != expected {
+            return Err(AppError::Message(format!("SHA256 校验失败: {relative_path}")));
+        }
+    }
+    let target = resolve_safe(target_root, relative_path)?;
+    ensure_parent(&target)?;
+    fs::copy(source, target)?;
+    Ok(())
+}
+
+fn ensure_parent(path: &Path) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn validate_instance(instance_dir: &Path) -> AppResult<()> {
+    if !instance_dir.exists() || !instance_dir.is_dir() {
+        return msg("目标实例目录不存在");
+    }
+    if !instance_dir.join("mods").is_dir() {
+        return msg("目标实例目录缺少 mods 目录，未通过 Minecraft 整合包结构检查");
+    }
+    Ok(())
+}
+
+fn manifest_digest(manifest: &PackManifest) -> AppResult<String> {
+    let bytes = serde_json::to_vec(manifest)?;
+    use sha2::{Digest, Sha256};
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn minecraft_running() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let output = Command::new("tasklist").output();
+    let Ok(output) = output else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    text.contains("minecraftlauncher.exe") || text.contains("minecraft.exe")
+}
+
+fn dedupe(values: &mut Vec<String>) {
+    let mut set = BTreeSet::new();
+    values.retain(|value| set.insert(value.clone()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::scan_pack_source;
+    use std::{fs, path::Path};
+    use tempfile::tempdir;
+
+    #[test]
+    fn apply_preserves_user_modified_pack_file_and_user_added_mod() {
+        let temp = tempdir().unwrap();
+        let old_source = temp.path().join("old");
+        let new_source = temp.path().join("new");
+        let instance = temp.path().join("instance");
+
+        write_file(&old_source, "mods/a.jar", b"old-a");
+        write_file(&old_source, "mods/remove.jar", b"remove-me");
+        write_file(&new_source, "mods/a.jar", b"new-a");
+        write_file(&new_source, "mods/b.jar", b"new-b");
+        write_file(&instance, "mods/a.jar", b"user-edited-a");
+        write_file(&instance, "mods/remove.jar", b"remove-me");
+        write_file(&instance, "mods/user-extra.jar", b"user-extra");
+
+        let old_manifest = scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest = scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+
+        let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
+
+        assert_eq!(fs::read(instance.join("mods/a.jar")).unwrap(), b"user-edited-a");
+        assert_eq!(fs::read(instance.join("mods/b.jar")).unwrap(), b"new-b");
+        assert_eq!(fs::read(instance.join("mods/user-extra.jar")).unwrap(), b"user-extra");
+        assert!(!instance.join("mods/remove.jar").exists());
+        assert_eq!(result.plan.conflicts.len(), 1);
+        assert!(instance.join(".packdelta/state.json").exists());
+    }
+
+    #[test]
+    fn rollback_restores_removed_files_without_deleting_user_extra_mod() {
+        let temp = tempdir().unwrap();
+        let old_source = temp.path().join("old");
+        let new_source = temp.path().join("new");
+        let instance = temp.path().join("instance");
+
+        write_file(&old_source, "mods/a.jar", b"old-a");
+        write_file(&old_source, "mods/remove.jar", b"remove-me");
+        write_file(&new_source, "mods/a.jar", b"new-a");
+        write_file(&new_source, "mods/b.jar", b"new-b");
+        write_file(&instance, "mods/a.jar", b"old-a");
+        write_file(&instance, "mods/remove.jar", b"remove-me");
+        write_file(&instance, "mods/user-extra.jar", b"user-extra");
+
+        let old_manifest = scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest = scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+
+        let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
+        rollback(&instance, &result.backup_id).unwrap();
+
+        assert_eq!(fs::read(instance.join("mods/a.jar")).unwrap(), b"old-a");
+        assert_eq!(fs::read(instance.join("mods/remove.jar")).unwrap(), b"remove-me");
+        assert_eq!(fs::read(instance.join("mods/user-extra.jar")).unwrap(), b"user-extra");
+    }
+
+    fn write_file(root: &Path, relative: &str, content: &[u8]) {
+        let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+}
