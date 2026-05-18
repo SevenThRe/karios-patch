@@ -17,3 +17,7 @@ pub fn sha256_file(path: &Path) -> AppResult<String> {
 
     Ok(format!("{:x}", hasher.finalize()))
 }
+
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}

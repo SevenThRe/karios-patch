@@ -2,8 +2,8 @@ use crate::{
     backup,
     diff::{ManifestDiff, RenamedFile, UpdatedFile},
     error::{AppError, AppResult, msg},
-    hash::sha256_file,
-    manifest::{FileType, ManifestFile, Owner, PackManifest, Strategy, resolve_safe, write_manifest},
+    hash::{sha256_bytes, sha256_file},
+    manifest::{FileType, ManifestFile, Owner, PackManifest, Strategy, read_source_file, resolve_safe, source_file_exists, write_manifest},
     state,
 };
 use serde::{Deserialize, Serialize};
@@ -445,12 +445,9 @@ fn merge_config_file(
     relative_path: &str,
     expected_sha: Option<&str>,
 ) -> AppResult<()> {
-    let new_path = resolve_safe(new_source, relative_path)?;
-    if !new_path.exists() {
-        return Err(AppError::Message(format!("源文件不存在: {}", new_path.display())));
-    }
+    let new_bytes = read_source_file(new_source, relative_path)?;
     if let Some(expected) = expected_sha {
-        let actual_sha = sha256_file(&new_path)?;
+        let actual_sha = sha256_bytes(&new_bytes);
         if actual_sha != expected {
             return Err(AppError::Message(format!("SHA256 校验失败: {relative_path}")));
         }
@@ -462,8 +459,8 @@ fn merge_config_file(
         return Ok(());
     }
 
-    let old_path = resolve_safe(old_source, relative_path)?;
-    if sha256_file(&target)? == sha256_file(&old_path)? {
+    let old_bytes = read_source_file(old_source, relative_path)?;
+    if sha256_file(&target)? == sha256_bytes(&old_bytes) {
         copy_from_source(new_source, instance_dir, relative_path, expected_sha)?;
         return Ok(());
     }
@@ -480,10 +477,9 @@ fn merge_config_file(
 }
 
 fn read_utf8(root: &Path, relative_path: &str) -> AppResult<String> {
-    let path = resolve_safe(root, relative_path)?;
-    let bytes = fs::read(&path)?;
+    let bytes = read_source_file(root, relative_path)?;
     String::from_utf8(bytes)
-        .map_err(|_| AppError::Message(format!("config 不是 UTF-8 文本，无法自动合并: {}", path.display())))
+        .map_err(|_| AppError::Message(format!("config 不是 UTF-8 文本，无法自动合并: {relative_path}")))
 }
 
 fn merge_text(old: &str, local: &str, new: &str) -> Option<String> {
@@ -551,11 +547,15 @@ fn split_preserving_newlines(value: &str) -> Vec<&str> {
 }
 
 fn copy_from_source(source_root: &Path, target_root: &Path, relative_path: &str, expected_sha: Option<&str>) -> AppResult<()> {
-    let source = resolve_safe(source_root, relative_path)?;
-    if !source.exists() {
-        return Err(AppError::Message(format!("源文件不存在: {}", source.display())));
+    if !source_file_exists(source_root, relative_path)? {
+        return Err(AppError::Message(format!(
+            "源文件不存在: {} -> {}",
+            source_root.display(),
+            relative_path
+        )));
     }
-    let actual_sha = sha256_file(&source)?;
+    let content = read_source_file(source_root, relative_path)?;
+    let actual_sha = sha256_bytes(&content);
     if let Some(expected) = expected_sha {
         if actual_sha != expected {
             return Err(AppError::Message(format!("SHA256 校验失败: {relative_path}")));
@@ -563,7 +563,7 @@ fn copy_from_source(source_root: &Path, target_root: &Path, relative_path: &str,
     }
     let target = resolve_safe(target_root, relative_path)?;
     ensure_parent(&target)?;
-    fs::copy(source, target)?;
+    fs::write(target, content)?;
     Ok(())
 }
 
@@ -611,8 +611,9 @@ fn dedupe(values: &mut Vec<String>) {
 mod tests {
     use super::*;
     use crate::manifest::scan_pack_source;
-    use std::{fs, path::Path};
+    use std::{fs, io::Write, path::Path};
     use tempfile::tempdir;
+    use zip::{ZipWriter, write::SimpleFileOptions};
 
     #[test]
     fn apply_preserves_user_modified_pack_file_and_user_added_mod() {
@@ -769,9 +770,59 @@ mod tests {
         assert!(!instance.join("config/new.toml").exists());
     }
 
+    #[test]
+    fn apply_update_can_read_official_sources_from_zip_files() {
+        let temp = tempdir().unwrap();
+        let old_zip = temp.path().join("old.zip");
+        let new_zip = temp.path().join("new.zip");
+        let instance = temp.path().join("instance");
+
+        write_zip(
+            &old_zip,
+            &[
+                ("WorldsVault/mods/a.jar", b"old-a".as_slice()),
+                ("WorldsVault/mods/remove.jar", b"remove-me".as_slice()),
+            ],
+        );
+        write_zip(
+            &new_zip,
+            &[
+                ("WorldsVault/mods/a.jar", b"new-a".as_slice()),
+                ("WorldsVault/mods/b.jar", b"new-b".as_slice()),
+            ],
+        );
+        write_file(&instance, "mods/a.jar", b"old-a");
+        write_file(&instance, "mods/remove.jar", b"remove-me");
+        write_file(&instance, "mods/user-extra.jar", b"user-extra");
+
+        let old_manifest = scan_pack_source(&old_zip, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest = scan_pack_source(&new_zip, None, None, Some("1.0.1".to_string())).unwrap();
+
+        assert!(old_manifest.files.iter().any(|file| file.path == "mods/a.jar"));
+
+        let result = apply_update(&instance, &old_zip, &new_zip, old_manifest, new_manifest).unwrap();
+
+        assert_eq!(fs::read(instance.join("mods/a.jar")).unwrap(), b"new-a");
+        assert_eq!(fs::read(instance.join("mods/b.jar")).unwrap(), b"new-b");
+        assert_eq!(fs::read(instance.join("mods/user-extra.jar")).unwrap(), b"user-extra");
+        assert!(!instance.join("mods/remove.jar").exists());
+        assert!(result.plan.conflicts.is_empty());
+    }
+
     fn write_file(root: &Path, relative: &str, content: &[u8]) {
         let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = fs::File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        for (name, content) in entries {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(content).unwrap();
+        }
+        zip.finish().unwrap();
     }
 }

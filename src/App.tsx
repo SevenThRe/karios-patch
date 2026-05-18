@@ -198,8 +198,8 @@ const i18n = {
     baseline: '基准',
     target: '目标',
     selectInstance: '选择 Minecraft 实例目录',
-    selectOld: '选择旧官方包目录',
-    selectNew: '选择新官方包目录',
+    selectOld: '选择旧官方包目录或 ZIP',
+    selectNew: '选择新官方包目录或 ZIP',
     waitingScan: '等待扫描',
     notScanned: '未扫描',
     required: '必需',
@@ -316,8 +316,8 @@ const i18n = {
     baseline: 'Baseline',
     target: 'Target',
     selectInstance: 'Select a Minecraft instance directory',
-    selectOld: 'Select the previous official pack',
-    selectNew: 'Select the target official pack',
+    selectOld: 'Select the previous official pack folder or ZIP',
+    selectNew: 'Select the target official pack folder or ZIP',
     waitingScan: 'Waiting for scan',
     notScanned: 'Not scanned',
     required: 'Required',
@@ -604,6 +604,22 @@ function App() {
 
   async function pickDirectory(key: PreferencePathKey, setter: (path: string) => void) {
     const selected = await open({ directory: true, multiple: false })
+    if (typeof selected === 'string') {
+      setter(selected)
+      persistPreferences({ [key]: selected })
+      setPlan(null)
+      setLastApply(null)
+      setCompareResult(null)
+      setInstanceManifest(null)
+    }
+  }
+
+  async function pickZipSource(key: PreferencePathKey, setter: (path: string) => void) {
+    const selected = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: 'Minecraft pack zip', extensions: ['zip'] }],
+    })
     if (typeof selected === 'string') {
       setter(selected)
       persistPreferences({ [key]: selected })
@@ -932,6 +948,7 @@ function App() {
               version={plan ? `${locale === 'zh' ? '当前基准' : 'Current baseline'} ${plan.from}` : copy.notScanned}
               meta={oldSource ? copy.selected : copy.required}
               onPick={() => pickDirectory('old_source', setOldSource)}
+              onPickZip={() => pickZipSource('old_source', setOldSource)}
             />
             <SourceCard
               icon={<Sparkles size={19} />}
@@ -943,6 +960,7 @@ function App() {
               version={plan ? `${locale === 'zh' ? '目标版本' : 'Target version'} ${plan.to}` : copy.notScanned}
               meta={newSource ? copy.selected : copy.required}
               onPick={() => pickDirectory('new_source', setNewSource)}
+              onPickZip={() => pickZipSource('new_source', setNewSource)}
             />
           </section>
 
@@ -1064,6 +1082,7 @@ function App() {
                     version={compareResult ? compareResult.old_manifest.version : copy.notScanned}
                     meta={oldSource ? copy.selected : copy.required}
                     onPick={() => pickDirectory('old_source', setOldSource)}
+                    onPickZip={() => pickZipSource('old_source', setOldSource)}
                   />
                   <SourceCard
                     icon={<Sparkles size={19} />}
@@ -1075,6 +1094,7 @@ function App() {
                     version={compareResult ? compareResult.new_manifest.version : copy.notScanned}
                     meta={newSource ? copy.selected : copy.required}
                     onPick={() => pickDirectory('new_source', setNewSource)}
+                    onPickZip={() => pickZipSource('new_source', setNewSource)}
                   />
                 </div>
                 <button type="button" className="action-button primary page-action" onClick={runCompareSources} disabled={!oldSource || !newSource || Boolean(busy)}>
@@ -1119,6 +1139,7 @@ function App() {
                     version={plan ? `${locale === 'zh' ? '当前基准' : 'Current baseline'} ${plan.from}` : copy.notScanned}
                     meta={oldSource ? copy.selected : copy.required}
                     onPick={() => pickDirectory('old_source', setOldSource)}
+                    onPickZip={() => pickZipSource('old_source', setOldSource)}
                   />
                   <SourceCard
                     icon={<Sparkles size={19} />}
@@ -1130,6 +1151,7 @@ function App() {
                     version={plan ? `${locale === 'zh' ? '目标版本' : 'Target version'} ${plan.to}` : copy.notScanned}
                     meta={newSource ? copy.selected : copy.required}
                     onPick={() => pickDirectory('new_source', setNewSource)}
+                    onPickZip={() => pickZipSource('new_source', setNewSource)}
                   />
                 </div>
                 <div className="page-button-row">
@@ -1294,6 +1316,7 @@ function SourceCard({
   version,
   meta,
   onPick,
+  onPickZip,
 }: {
   icon: ReactNode
   title: string
@@ -1304,6 +1327,7 @@ function SourceCard({
   version: string
   meta: string
   onPick: () => void
+  onPickZip?: () => void
 }) {
   return (
     <article className="source-card">
@@ -1319,7 +1343,12 @@ function SourceCard({
         <button type="button" onClick={onPick} aria-label={`Select ${title}`}>
           <Folder size={17} />
         </button>
-        <button type="button" aria-label="More options">
+        <button
+          type="button"
+          onClick={onPickZip}
+          disabled={!onPickZip}
+          aria-label={onPickZip ? `Select ${title} ZIP` : 'More options'}
+        >
           <MoreHorizontal size={17} />
         </button>
       </div>
