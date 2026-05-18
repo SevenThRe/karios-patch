@@ -51,6 +51,7 @@ type UpdatePlan = {
   added: FileAction[]
   removed: FileAction[]
   updated: FileAction[]
+  merged: FileAction[]
   renamed: RenameAction[]
   preserved: string[]
   conflicts: Conflict[]
@@ -214,6 +215,7 @@ const i18n = {
     pendingChanges: '待处理变更',
     addedFiles: '新增文件',
     updatedFiles: '更新文件',
+    mergedConfigs: '合并配置',
     removedFiles: '删除文件',
     conflicts: '冲突',
     diffPreview: '差异预览',
@@ -242,7 +244,7 @@ const i18n = {
     notConfigured: '未配置',
     loadNotes: '加载日志',
     noChangelog: '尚未加载更新日志',
-    noChangelogHint: '从更新源配置的 GitHub 仓库加载 Release Notes。',
+    noChangelogHint: '从更新源配置的 GitHub 仓库加载发布说明。',
     sourceSelection: '源包选择',
     oldVsNew: '旧包 / 新包',
     diffResult: '差异结果',
@@ -331,6 +333,7 @@ const i18n = {
     pendingChanges: 'Pending Changes',
     addedFiles: 'Added Files',
     updatedFiles: 'Updated Files',
+    mergedConfigs: 'Merged Configs',
     removedFiles: 'Removed Files',
     conflicts: 'Conflicts',
     diffPreview: 'Diff Preview',
@@ -467,9 +470,9 @@ function App() {
   const totals = useMemo(() => {
     const p = plan
     return {
-      changed: p ? p.added.length + p.removed.length + p.updated.length + p.renamed.length : 0,
+      changed: p ? p.added.length + p.removed.length + p.updated.length + p.merged.length + p.renamed.length : 0,
       added: p?.added.length ?? 0,
-      updated: p ? p.updated.length + p.renamed.length : 0,
+      updated: p ? p.updated.length + p.merged.length + p.renamed.length : 0,
       removed: p?.removed.length ?? 0,
       protected: p?.preserved.length ?? 0,
       conflicts: p?.conflicts.length ?? 0,
@@ -664,8 +667,8 @@ function App() {
       setPlan(result)
       setMessage(
         locale === 'zh'
-          ? `计划已生成：新增 ${result.added.length}，更新 ${result.updated.length}，删除 ${result.removed.length}，冲突 ${result.conflicts.length}。`
-          : `Plan generated: ${result.added.length} added, ${result.updated.length} updated, ${result.removed.length} removed, ${result.conflicts.length} conflicts.`,
+          ? `计划已生成：新增 ${result.added.length}，更新 ${result.updated.length}，合并配置 ${result.merged.length}，删除 ${result.removed.length}，冲突 ${result.conflicts.length}。`
+          : `Plan generated: ${result.added.length} added, ${result.updated.length} updated, ${result.merged.length} config merges, ${result.removed.length} removed, ${result.conflicts.length} conflicts.`,
       )
       await refreshBackups()
     } catch (error) {
@@ -738,6 +741,19 @@ function App() {
     try {
       await invoke('open_folder', { path: `${instanceDir}\\.packdelta` })
       setMessage(locale === 'zh' ? '已打开 .packdelta 状态目录。' : 'Opened the .packdelta state directory.')
+    } catch (error) {
+      setMessage(String(error))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function openConflictFolder() {
+    if (!instanceDir || !plan || !lastApply) return
+    setBusy('conflicts')
+    try {
+      await invoke('open_folder', { path: `${instanceDir}\\.packdelta\\conflicts\\${plan.from}_to_${plan.to}` })
+      setMessage(locale === 'zh' ? '已打开冲突候选目录。' : 'Opened the conflict candidate directory.')
     } catch (error) {
       setMessage(String(error))
     } finally {
@@ -825,7 +841,7 @@ function App() {
   }
 
   return (
-    <main className="app-shell">
+    <main className="app-shell" data-locale={locale}>
       <section className="layout">
         <aside className="sidebar">
           <div className="brand-block">
@@ -980,7 +996,7 @@ function App() {
                     <p>{plan ? `${totals.conflicts} ${copy.conflicts}, ${totals.protected} ${locale === 'zh' ? '个保留文件' : 'preserved files'}` : copy.checkConflicts}</p>
                   </div>
                 </div>
-                <button type="button" className="ghost-button" disabled={!plan || !plan.conflicts.length}>{locale === 'zh' ? '审阅' : 'Review'}</button>
+                <button type="button" className="ghost-button" onClick={openConflictFolder} disabled={!lastApply || !plan || !plan.conflicts.length || Boolean(busy)}>{locale === 'zh' ? '审阅' : 'Review'}</button>
               </section>
 
               <section className="panel side-panel" id="backups">
@@ -989,7 +1005,7 @@ function App() {
                   <div>
                     <h2>{copy.latestBackup}</h2>
                     {backups.length ? (
-                      <p>{backups[0].from} {'->'} {backups[0].to} · {backups[0].file_count} files</p>
+                      <p>{backups[0].from} {'->'} {backups[0].to} · {backups[0].file_count} {copy.files}</p>
                     ) : (
                       <p>{copy.noBackup}</p>
                     )}
@@ -1013,7 +1029,7 @@ function App() {
                 <InfoRow label={locale === 'zh' ? '新源包' : 'New Source'} value={newSource || (locale === 'zh' ? '未选择' : 'Not selected')} />
                 <InfoRow label={locale === 'zh' ? '当前' : 'Current'} value={plan?.from ?? copy.notScanned} />
                 <InfoRow label={copy.target} value={plan?.to ?? copy.notScanned} />
-                {lastApply && <InfoRow label="Last Backup" value={lastApply.backup_id} />}
+                {lastApply && <InfoRow label={copy.lastBackup} value={lastApply.backup_id} />}
               </section>
 
             </aside>
@@ -1022,12 +1038,12 @@ function App() {
           <footer className="execute-bar">
             <button type="button" className="execute-button" onClick={runApply} disabled={!canPreview || !plan}>
               <Rocket size={20} />
-              <span>Execute Update Plan</span>
-              <small>Back up first, then safely update the pack</small>
+              <span>{copy.executePlan}</span>
+              <small>{copy.backupFirst}</small>
             </button>
             <div className="safety-note">
               <ShieldCheck size={18} />
-              Backup-first protection enabled
+              {copy.backupFirst}
             </div>
           </footer>
             </>
@@ -1036,43 +1052,43 @@ function App() {
           {activePage === 'diff' && (
             <section className="single-page-grid">
               <section className="panel workflow-panel">
-                <PanelHeader title="Source Selection" subtitle="Old vs New" />
+                <PanelHeader title={copy.sourceSelection} subtitle={copy.oldVsNew} />
                 <div className="page-source-stack">
                   <SourceCard
                     icon={<FolderOpen size={19} />}
-                    title="Old Official Pack"
-                    badge="Baseline"
+                    title={copy.oldPack}
+                    badge={copy.baseline}
                     badgeTone="amber"
                     value={oldSource}
-                    fallback="Select the previous official pack"
-                    version={compareResult ? compareResult.old_manifest.version : 'Not scanned'}
-                    meta={oldSource ? 'Directory selected' : 'Required'}
+                    fallback={copy.selectOld}
+                    version={compareResult ? compareResult.old_manifest.version : copy.notScanned}
+                    meta={oldSource ? copy.selected : copy.required}
                     onPick={() => pickDirectory('old_source', setOldSource)}
                   />
                   <SourceCard
                     icon={<Sparkles size={19} />}
-                    title="New Official Pack"
-                    badge="Target"
+                    title={copy.newPack}
+                    badge={copy.target}
                     badgeTone="violet"
                     value={newSource}
-                    fallback="Select the target official pack"
-                    version={compareResult ? compareResult.new_manifest.version : 'Not scanned'}
-                    meta={newSource ? 'Directory selected' : 'Required'}
+                    fallback={copy.selectNew}
+                    version={compareResult ? compareResult.new_manifest.version : copy.notScanned}
+                    meta={newSource ? copy.selected : copy.required}
                     onPick={() => pickDirectory('new_source', setNewSource)}
                   />
                 </div>
                 <button type="button" className="action-button primary page-action" onClick={runCompareSources} disabled={!oldSource || !newSource || Boolean(busy)}>
                   <GitCompare size={18} />
-                  <span>Compare Sources</span>
-                  <small>Scan both official packs and calculate file diff</small>
+                  <span>{copy.compareSources}</span>
+                  <small>{copy.scanBothPacks}</small>
                 </button>
               </section>
               <section className="panel diff-panel">
                 <PanelHeader
-                  title="Diff Result"
-                  subtitle={compareResult ? `${compareResult.old_manifest.pack_name} -> ${compareResult.new_manifest.pack_name}` : 'Waiting for compare'}
+                  title={copy.diffResult}
+                  subtitle={compareResult ? `${compareResult.old_manifest.pack_name} -> ${compareResult.new_manifest.pack_name}` : copy.waitingCompare}
                 />
-                <DiffResultView compareResult={compareResult} />
+                <DiffResultView compareResult={compareResult} copy={copy} />
               </section>
             </section>
           )}
@@ -1080,57 +1096,57 @@ function App() {
           {activePage === 'plan' && (
             <section className="single-page-grid">
               <section className="panel workflow-panel">
-                <PanelHeader title="Protected Update Plan" subtitle={plan ? `${plan.from} -> ${plan.to}` : 'Not generated'} />
+                <PanelHeader title={copy.protectedPlan} subtitle={plan ? `${plan.from} -> ${plan.to}` : copy.notGenerated} />
                 <div className="page-source-stack">
                   <SourceCard
                     icon={<HardDrive size={19} />}
-                    title="User Instance Directory"
-                    badge="In use"
+                    title={copy.instanceDir}
+                    badge={copy.inUse}
                     badgeTone="green"
                     value={instanceDir}
-                    fallback="Select a Minecraft instance directory"
-                    version={plan ? `Instance baseline ${plan.from}` : 'Waiting for scan'}
-                    meta={instanceDir ? 'Directory selected' : 'Required'}
+                    fallback={copy.selectInstance}
+                    version={plan ? `${locale === 'zh' ? '实例基准' : 'Instance baseline'} ${plan.from}` : copy.waitingScan}
+                    meta={instanceDir ? copy.selected : copy.required}
                     onPick={() => pickDirectory('instance_dir', setInstanceDir)}
                   />
                   <SourceCard
                     icon={<FolderOpen size={19} />}
-                    title="Old Official Pack"
-                    badge="Baseline"
+                    title={copy.oldPack}
+                    badge={copy.baseline}
                     badgeTone="amber"
                     value={oldSource}
-                    fallback="Select the previous official pack"
-                    version={plan ? `Current baseline ${plan.from}` : 'Not scanned'}
-                    meta={oldSource ? 'Directory selected' : 'Required'}
+                    fallback={copy.selectOld}
+                    version={plan ? `${locale === 'zh' ? '当前基准' : 'Current baseline'} ${plan.from}` : copy.notScanned}
+                    meta={oldSource ? copy.selected : copy.required}
                     onPick={() => pickDirectory('old_source', setOldSource)}
                   />
                   <SourceCard
                     icon={<Sparkles size={19} />}
-                    title="New Official Pack"
-                    badge="Target"
+                    title={copy.newPack}
+                    badge={copy.target}
                     badgeTone="violet"
                     value={newSource}
-                    fallback="Select the target official pack"
-                    version={plan ? `Target version ${plan.to}` : 'Not scanned'}
-                    meta={newSource ? 'Directory selected' : 'Required'}
+                    fallback={copy.selectNew}
+                    version={plan ? `${locale === 'zh' ? '目标版本' : 'Target version'} ${plan.to}` : copy.notScanned}
+                    meta={newSource ? copy.selected : copy.required}
                     onPick={() => pickDirectory('new_source', setNewSource)}
                   />
                 </div>
                 <div className="page-button-row">
                   <button type="button" className="action-button primary" onClick={runPreview} disabled={!canPreview}>
                     <GitCompare size={18} />
-                    <span>Generate Plan</span>
-                    <small>Build protected update actions</small>
+                    <span>{copy.generatePlan}</span>
+                    <small>{copy.buildPlanActions}</small>
                   </button>
                   <button type="button" className="action-button" onClick={runApply} disabled={!canPreview || !plan}>
                     <Rocket size={18} />
-                    <span>Execute Plan</span>
-                    <small>Backup first, then write changes</small>
+                    <span>{copy.executePlan}</span>
+                    <small>{copy.backupThenWrite}</small>
                   </button>
                 </div>
               </section>
               <section className="panel plan-panel">
-                <PanelHeader title="Plan Details" subtitle={`${totals.changed} changed, ${totals.conflicts} conflicts`} />
+                <PanelHeader title={copy.planDetails} subtitle={locale === 'zh' ? `${totals.changed} 个变更，${totals.conflicts} 个冲突` : `${totals.changed} changed, ${totals.conflicts} conflicts`} />
                 <Stepper conflicts={totals.conflicts} hasPlan={Boolean(plan)} locale={locale} />
                 <ConflictList plan={plan} locale={locale} />
               </section>
@@ -1140,26 +1156,26 @@ function App() {
           {activePage === 'backups' && (
             <section className="single-page-grid">
               <section className="panel workflow-panel">
-                <PanelHeader title="Backup Records" subtitle={backups.length ? `${backups.length} found` : 'Instance required'} />
+                <PanelHeader title={copy.backupRecords} subtitle={backups.length ? (locale === 'zh' ? `找到 ${backups.length} 条` : `${backups.length} found`) : copy.instanceRequired} />
                 <SourceCard
                   icon={<HardDrive size={19} />}
-                  title="User Instance Directory"
-                  badge="In use"
+                  title={copy.instanceDir}
+                  badge={copy.inUse}
                   badgeTone="green"
                   value={instanceDir}
-                  fallback="Select a Minecraft instance directory"
-                  version={instanceDir ? 'Directory selected' : 'Waiting for instance'}
-                  meta={instanceDir ? 'Ready to list backups' : 'Required'}
+                  fallback={copy.selectInstance}
+                  version={instanceDir ? copy.selected : copy.waitingInstance}
+                  meta={instanceDir ? copy.readyBackupList : copy.required}
                   onPick={() => pickDirectory('instance_dir', setInstanceDir)}
                 />
                 <button type="button" className="action-button primary page-action" onClick={refreshBackups} disabled={!instanceDir || Boolean(busy)}>
                   <RefreshCw size={18} />
-                  <span>Refresh Backups</span>
-                  <small>Read .packdelta backup manifests</small>
+                  <span>{copy.refreshScan}</span>
+                  <small>{copy.readBackups}</small>
                 </button>
               </section>
               <section className="panel backup-list-panel">
-                <PanelHeader title="Available Backups" subtitle="Rollback restores captured files" />
+                <PanelHeader title={copy.availableBackups} subtitle={copy.rollbackHint} />
                 <BackupList backups={backups} busy={busy} onRollback={rollback} copy={copy} />
               </section>
             </section>
@@ -1168,39 +1184,39 @@ function App() {
           {activePage === 'instance' && (
             <section className="single-page-grid">
               <section className="panel workflow-panel">
-                <PanelHeader title="Instance Scan" subtitle={instanceManifest ? `${instanceManifest.files.length} files` : 'Not scanned'} />
+                <PanelHeader title={copy.instanceScan} subtitle={instanceManifest ? `${instanceManifest.files.length} ${copy.files}` : copy.notScanned} />
                 <SourceCard
                   icon={<HardDrive size={19} />}
-                  title="User Instance Directory"
-                  badge="In use"
+                  title={copy.instanceDir}
+                  badge={copy.inUse}
                   badgeTone="green"
                   value={instanceDir}
-                  fallback="Select a Minecraft instance directory"
-                  version={instanceManifest?.pack_name ?? 'Waiting for scan'}
-                  meta={instanceDir ? 'Directory selected' : 'Required'}
+                  fallback={copy.selectInstance}
+                  version={instanceManifest?.pack_name ?? copy.waitingScan}
+                  meta={instanceDir ? copy.selected : copy.required}
                   onPick={() => pickDirectory('instance_dir', setInstanceDir)}
                 />
                 <div className="page-button-row">
                   <button type="button" className="action-button primary" onClick={scanInstance} disabled={!instanceDir || Boolean(busy)}>
                     <HardDrive size={18} />
-                    <span>Scan Instance</span>
-                    <small>Build a local manifest</small>
+                    <span>{copy.scanInstance}</span>
+                    <small>{copy.buildManifest}</small>
                   </button>
                   <button type="button" className="action-button" onClick={openPackDelta} disabled={!instanceDir || Boolean(busy)}>
                     <Folder size={18} />
-                    <span>Open .packdelta</span>
-                    <small>Open state folder</small>
+                    <span>{copy.openPackdelta}</span>
+                    <small>{locale === 'zh' ? '打开状态目录' : 'Open state folder'}</small>
                   </button>
                 </div>
               </section>
               <section className="panel instance-panel">
-                <PanelHeader title="Instance Manifest" subtitle={instanceManifest?.created_at ? new Date(instanceManifest.created_at).toLocaleString() : 'Waiting'} />
-                <InfoRow label="Instance" value={instanceDir || 'Not selected'} />
-                <InfoRow label="Pack Name" value={instanceManifest?.pack_name ?? 'Not scanned'} />
-                <InfoRow label="Pack ID" value={instanceManifest?.pack_id ?? 'Not scanned'} />
-                <InfoRow label="Version" value={instanceManifest?.version ?? 'Not scanned'} />
-                <InfoRow label="Files" value={String(instanceManifest?.files.length ?? 0)} />
-                <FileTypeSummary manifest={instanceManifest} />
+                <PanelHeader title={copy.instanceManifest} subtitle={instanceManifest?.created_at ? new Date(instanceManifest.created_at).toLocaleString() : copy.waiting} />
+                <InfoRow label={copy.instance} value={instanceDir || (locale === 'zh' ? '未选择' : 'Not selected')} />
+                <InfoRow label={copy.packName} value={instanceManifest?.pack_name ?? copy.notScanned} />
+                <InfoRow label={copy.packId} value={instanceManifest?.pack_id ?? copy.notScanned} />
+                <InfoRow label={copy.version} value={instanceManifest?.version ?? copy.notScanned} />
+                <InfoRow label={copy.files} value={String(instanceManifest?.files.length ?? 0)} />
+                <FileTypeSummary manifest={instanceManifest} copy={copy} />
               </section>
             </section>
           )}
@@ -1209,8 +1225,8 @@ function App() {
             <section className="single-page-grid">
               <section className="panel app-update-panel app-update-page">
                 <PanelHeader
-                  title="Portable App Update"
-                  subtitle={appUpdate ? `${appUpdate.current_version} -> ${appUpdate.latest_version}` : `Current ${appVersion}`}
+                  title={copy.portableUpdate}
+                  subtitle={appUpdate ? `${appUpdate.current_version} -> ${appUpdate.latest_version}` : `${copy.currentVersion} ${appVersion}`}
                 />
                 <input
                   className="update-source-input"
@@ -1220,36 +1236,36 @@ function App() {
                 />
                 <div className="update-controls">
                   <button type="button" className="ghost-button" onClick={saveUpdateSource} disabled={!updateSource || Boolean(busy)}>
-                    Save
+                    {copy.save}
                   </button>
                   <button type="button" className="ghost-button" onClick={checkAppUpdate} disabled={!updateSource || Boolean(busy)}>
-                    Check
+                    {copy.check}
                   </button>
                   <button type="button" className="ghost-button" onClick={() => fetchChangelog()} disabled={!updateSource || Boolean(busy)}>
-                    Notes
+                    {copy.notes}
                   </button>
                   <button type="button" className="ghost-button" onClick={downloadAppUpdate} disabled={!appUpdate?.release || Boolean(busy)}>
-                    Download
+                    {copy.download}
                   </button>
                   <button type="button" className="ghost-button" onClick={installPortableUpdate} disabled={!downloadedUpdate || Boolean(busy)}>
-                    Apply
+                    {copy.apply}
                   </button>
                 </div>
                 <p className="update-status">
                   {downloadedUpdate
-                    ? `Verified ${downloadedUpdate.version}: ${downloadedUpdate.archive_path}`
+                    ? `${copy.verified} ${downloadedUpdate.version}: ${downloadedUpdate.archive_path}`
                     : appUpdate?.update_available
-                      ? `Available: ${appUpdate.latest_version}`
-                      : 'Portable updates use the configured GitHub release-index.json.'}
+                      ? `${copy.available}: ${appUpdate.latest_version}`
+                      : copy.updateSourceHint}
                 </p>
               </section>
 
               <section className="panel release-summary-panel">
-                <PanelHeader title="Release Source" subtitle="GitHub" />
-                <InfoRow label="App Version" value={appVersion} />
-                <InfoRow label="Latest Checked" value={appUpdate?.latest_version ?? 'Not checked'} />
-                <InfoRow label="Downloaded" value={downloadedUpdate?.version ?? 'None'} />
-                <InfoRow label="Update Source" value={updateSource || 'Not configured'} />
+                <PanelHeader title={copy.releaseSource} subtitle="GitHub" />
+                <InfoRow label={copy.appVersion} value={appVersion} />
+                <InfoRow label={copy.latestChecked} value={appUpdate?.latest_version ?? copy.notChecked} />
+                <InfoRow label={copy.downloaded} value={downloadedUpdate?.version ?? copy.none} />
+                <InfoRow label={copy.updateSource} value={updateSource || copy.notConfigured} />
               </section>
             </section>
           )}
@@ -1257,7 +1273,7 @@ function App() {
           {activePage === 'changelog' && (
             <section className="single-page-grid">
               <section className="panel changelog-panel changelog-page">
-                <PanelHeader title="Changelog" subtitle="GitHub Releases" />
+                <PanelHeader title={copy.changelogTitle} subtitle={copy.githubReleases} />
                 <ChangelogView releases={changelog} onLoad={() => fetchChangelog()} disabled={!updateSource || Boolean(busy)} copy={copy} />
               </section>
             </section>
@@ -1358,10 +1374,11 @@ function DiffView({ plan, copy }: { plan: UpdatePlan | null; copy: typeof i18n.z
   }
 
   const sections = [
-    { tone: 'green', title: 'Added', count: plan.added.length, items: plan.added.map((item) => item.path) },
-    { tone: 'amber', title: 'Updated', count: plan.updated.length + plan.renamed.length, items: [...plan.updated.map((item) => item.path), ...plan.renamed.map((item) => `${item.from} -> ${item.to}`)] },
-    { tone: 'red', title: 'Removed', count: plan.removed.length, items: plan.removed.map((item) => item.path) },
-    { tone: 'violet', title: 'Protected User Files', count: plan.preserved.length, items: plan.preserved },
+    { tone: 'green', title: copy.addedFiles, count: plan.added.length, items: plan.added.map((item) => item.path) },
+    { tone: 'amber', title: copy.updatedFiles, count: plan.updated.length + plan.renamed.length, items: [...plan.updated.map((item) => item.path), ...plan.renamed.map((item) => `${item.from} -> ${item.to}`)] },
+    { tone: 'blue', title: copy.mergedConfigs, count: plan.merged.length, items: plan.merged.map((item) => item.path) },
+    { tone: 'red', title: copy.removedFiles, count: plan.removed.length, items: plan.removed.map((item) => item.path) },
+    { tone: 'violet', title: copy.protectedUserFiles, count: plan.preserved.length, items: plan.preserved },
   ]
 
   return (
@@ -1376,8 +1393,8 @@ function DiffView({ plan, copy }: { plan: UpdatePlan | null; copy: typeof i18n.z
             {section.items.slice(0, 3).map((item) => (
               <li key={item}>{item}</li>
             ))}
-            {section.count > 3 && <li>... {section.count - 3} more files</li>}
-            {!section.items.length && <li>No files in this group</li>}
+            {section.count > 3 && <li>... {section.count - 3} {copy.moreFiles}</li>}
+            {!section.items.length && <li>{copy.noFilesGroup}</li>}
           </ul>
         </section>
       ))}
@@ -1385,31 +1402,31 @@ function DiffView({ plan, copy }: { plan: UpdatePlan | null; copy: typeof i18n.z
   )
 }
 
-function DiffResultView({ compareResult }: { compareResult: CompareResult | null }) {
+function DiffResultView({ compareResult, copy }: { compareResult: CompareResult | null; copy: typeof i18n.zh }) {
   if (!compareResult) {
     return (
       <div className="empty-state">
         <GitCompare size={24} />
-        <strong>No source diff loaded</strong>
-        <p>Select the old and new official pack folders, then compare sources.</p>
+        <strong>{copy.sourceDiffEmpty}</strong>
+        <p>{copy.sourceDiffHint}</p>
       </div>
     )
   }
 
   const diff = compareResult.diff
   const sections = [
-    { tone: 'green', title: 'Added', count: diff.added.length, items: diff.added.map((item) => item.path) },
-    { tone: 'amber', title: 'Updated', count: diff.updated.length, items: diff.updated.map((item) => item.new.path) },
-    { tone: 'red', title: 'Removed', count: diff.removed.length, items: diff.removed.map((item) => item.path) },
-    { tone: 'violet', title: 'Renamed', count: diff.renamed.length, items: diff.renamed.map((item) => `${item.old.path} -> ${item.new.path}`) },
+    { tone: 'green', title: copy.addedFiles, count: diff.added.length, items: diff.added.map((item) => item.path) },
+    { tone: 'amber', title: copy.updatedFiles, count: diff.updated.length, items: diff.updated.map((item) => item.new.path) },
+    { tone: 'red', title: copy.removedFiles, count: diff.removed.length, items: diff.removed.map((item) => item.path) },
+    { tone: 'violet', title: copy.renamedFiles, count: diff.renamed.length, items: diff.renamed.map((item) => `${item.old.path} -> ${item.new.path}`) },
   ]
 
   return (
     <div className="diff-result-layout">
       <div className="mini-metrics">
-        <Metric icon={<FilePlus2 size={22} />} label="Added" value={diff.added.length} tone="green" />
-        <Metric icon={<RotateCcw size={22} />} label="Updated" value={diff.updated.length + diff.renamed.length} tone="amber" />
-        <Metric icon={<Trash2 size={22} />} label="Removed" value={diff.removed.length} tone="red" />
+        <Metric icon={<FilePlus2 size={22} />} label={copy.addedFiles} value={diff.added.length} tone="green" />
+        <Metric icon={<RotateCcw size={22} />} label={copy.updatedFiles} value={diff.updated.length + diff.renamed.length} tone="amber" />
+        <Metric icon={<Trash2 size={22} />} label={copy.removedFiles} value={diff.removed.length} tone="red" />
       </div>
       <div className="diff-list">
         {sections.map((section) => (
@@ -1422,8 +1439,8 @@ function DiffResultView({ compareResult }: { compareResult: CompareResult | null
               {section.items.slice(0, 8).map((item) => (
                 <li key={item}>{item}</li>
               ))}
-              {section.count > 8 && <li>... {section.count - 8} more files</li>}
-              {!section.items.length && <li>No files in this group</li>}
+              {section.count > 8 && <li>... {section.count - 8} {copy.moreFiles}</li>}
+              {!section.items.length && <li>{copy.noFilesGroup}</li>}
             </ul>
           </section>
         ))}
@@ -1499,7 +1516,7 @@ function BackupList({
             <strong>{backup.from} {'->'} {backup.to}</strong>
             <span>{backup.id}</span>
           </div>
-          <small>{backup.file_count} files</small>
+          <small>{backup.file_count} {copy.files}</small>
           <button type="button" className="ghost-button" onClick={() => onRollback(backup.id)} disabled={Boolean(busy)}>
             {copy.restore}
           </button>
@@ -1509,12 +1526,12 @@ function BackupList({
   )
 }
 
-function FileTypeSummary({ manifest }: { manifest: PackManifest | null }) {
+function FileTypeSummary({ manifest, copy }: { manifest: PackManifest | null; copy: typeof i18n.zh }) {
   if (!manifest) {
     return (
       <div className="inline-empty">
         <HardDrive size={17} />
-        Scan the instance to inspect file ownership and strategies.
+        {copy.fileSummaryHint}
       </div>
     )
   }
@@ -1527,10 +1544,27 @@ function FileTypeSummary({ manifest }: { manifest: PackManifest | null }) {
   return (
     <div className="file-type-summary">
       {Object.entries(counts).map(([type, count]) => (
-        <InfoRow key={type} label={type} value={String(count)} />
+        <InfoRow key={type} label={fileTypeLabel(type, copy)} value={String(count)} />
       ))}
     </div>
   )
+}
+
+function fileTypeLabel(type: string, copy: typeof i18n.zh) {
+  if (copy.dashboard !== '仪表盘') {
+    return type
+  }
+  const labels: Record<string, string> = {
+    mod: '模组',
+    config: '配置',
+    script: '脚本',
+    resourcepack: '资源包',
+    shaderpack: '光影包',
+    save: '存档',
+    runtime: '运行时',
+    other: '其他',
+  }
+  return labels[type.toLowerCase()] ?? type
 }
 
 function ChangelogView({

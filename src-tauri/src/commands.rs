@@ -64,7 +64,14 @@ pub fn preview_update(instance_dir: String, old_source: String, new_source: Stri
     let old_manifest = scan_source(Path::new(&old_source), None, None, Some("old-local".to_string()))?;
     let new_manifest = scan_source(Path::new(&new_source), None, None, Some("new-local".to_string()))?;
     let diff = diff::compare(&old_manifest, &new_manifest);
-    patch::build_plan(Path::new(&instance_dir), &old_manifest, &new_manifest, &diff)
+    patch::build_plan(
+        Path::new(&instance_dir),
+        Path::new(&old_source),
+        Path::new(&new_source),
+        &old_manifest,
+        &new_manifest,
+        &diff,
+    )
 }
 
 #[tauri::command]

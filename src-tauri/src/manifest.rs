@@ -178,7 +178,7 @@ fn classify(path: &str) -> (Owner, Strategy, FileType) {
         return (Owner::Pack, Strategy::Replace, FileType::Other);
     }
     if p.starts_with("config/") {
-        return (Owner::User, Strategy::Preserve, FileType::Config);
+        return (Owner::User, Strategy::Merge, FileType::Config);
     }
     if p.starts_with("resourcepacks/") {
         return (Owner::User, Strategy::Preserve, FileType::ResourcePack);
