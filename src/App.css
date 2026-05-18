@@ -769,6 +769,57 @@ button {
   margin-bottom: 0;
 }
 
+.operation-log-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.operation-log-panel .panel-header {
+  margin-bottom: 0;
+}
+
+.operation-log {
+  display: grid;
+  gap: 7px;
+  max-height: 220px;
+  overflow: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.operation-log li {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  gap: 8px;
+  border: 1px solid rgba(142, 160, 190, 0.13);
+  border-radius: 8px;
+  background: rgba(7, 12, 22, 0.28);
+  padding: 8px 9px;
+}
+
+.operation-log span {
+  color: var(--green);
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.operation-log li.warn span {
+  color: var(--amber);
+}
+
+.operation-log li.error span {
+  color: var(--red);
+}
+
+.operation-log p {
+  overflow-wrap: anywhere;
+  color: #aeb9cc;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .app-update-panel {
   display: grid;
   gap: 10px;

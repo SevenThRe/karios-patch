@@ -54,8 +54,15 @@ type UpdatePlan = {
   merged: FileAction[]
   renamed: RenameAction[]
   preserved: string[]
+  already_current: FileAction[]
   conflicts: Conflict[]
   backup_candidates: string[]
+  logs: OperationLog[]
+}
+
+type OperationLog = {
+  level: 'info' | 'warn' | 'error'
+  message: string
 }
 
 type ManifestFile = {
@@ -111,9 +118,10 @@ type BackupSummary = {
 }
 
 type ApplyResult = {
-  backup_id: string
+  backup_id?: string | null
   plan: UpdatePlan
   state_path: string
+  logs: OperationLog[]
 }
 
 type UpdateSourceConfig = {
@@ -475,10 +483,13 @@ function App() {
       updated: p ? p.updated.length + p.merged.length + p.renamed.length : 0,
       removed: p?.removed.length ?? 0,
       protected: p?.preserved.length ?? 0,
+      current: p?.already_current.length ?? 0,
       conflicts: p?.conflicts.length ?? 0,
       backups: p?.backup_candidates.length ?? 0,
     }
   }, [plan])
+
+  const canExecutePlan = Boolean(plan && (totals.changed > 0 || totals.conflicts > 0) && canPreview)
 
   function buildPreferences(overrides: Partial<AppPreferences> = {}): AppPreferences {
     return {
@@ -640,10 +651,23 @@ function App() {
         newSource,
       })
       setCompareResult(result)
+      let instanceAwarePlan: UpdatePlan | null = null
+      if (instanceDir) {
+        instanceAwarePlan = await invoke<UpdatePlan>('preview_update', {
+          instanceDir,
+          oldSource,
+          newSource,
+        })
+        setPlan(instanceAwarePlan)
+      }
       setMessage(
-        locale === 'zh'
-          ? `源包差异完成：新增 ${result.diff.added.length}，更新 ${result.diff.updated.length}，删除 ${result.diff.removed.length}。`
-          : `Source diff complete: ${result.diff.added.length} added, ${result.diff.updated.length} updated, ${result.diff.removed.length} removed.`,
+        instanceAwarePlan
+          ? locale === 'zh'
+            ? `源包差异完成：新增 ${result.diff.added.length}，更新 ${result.diff.updated.length}，删除 ${result.diff.removed.length}。实例待执行 ${instanceAwarePlan.added.length + instanceAwarePlan.updated.length + instanceAwarePlan.merged.length + instanceAwarePlan.removed.length + instanceAwarePlan.renamed.length}，已是最新 ${instanceAwarePlan.already_current.length}。`
+            : `Source diff complete: ${result.diff.added.length} added, ${result.diff.updated.length} updated, ${result.diff.removed.length} removed. Instance actions: ${instanceAwarePlan.added.length + instanceAwarePlan.updated.length + instanceAwarePlan.merged.length + instanceAwarePlan.removed.length + instanceAwarePlan.renamed.length}, already current: ${instanceAwarePlan.already_current.length}.`
+          : locale === 'zh'
+            ? `源包差异完成：新增 ${result.diff.added.length}，更新 ${result.diff.updated.length}，删除 ${result.diff.removed.length}。选择实例目录后可判断是否需要执行更新。`
+            : `Source diff complete: ${result.diff.added.length} added, ${result.diff.updated.length} updated, ${result.diff.removed.length} removed. Select an instance directory to determine whether apply is needed.`,
       )
     } catch (error) {
       setMessage(String(error))
@@ -683,8 +707,8 @@ function App() {
       setPlan(result)
       setMessage(
         locale === 'zh'
-          ? `计划已生成：新增 ${result.added.length}，更新 ${result.updated.length}，合并配置 ${result.merged.length}，删除 ${result.removed.length}，冲突 ${result.conflicts.length}。`
-          : `Plan generated: ${result.added.length} added, ${result.updated.length} updated, ${result.merged.length} config merges, ${result.removed.length} removed, ${result.conflicts.length} conflicts.`,
+          ? `计划已生成：新增 ${result.added.length}，更新 ${result.updated.length}，合并配置 ${result.merged.length}，删除 ${result.removed.length}，已是最新 ${result.already_current.length}，冲突 ${result.conflicts.length}。`
+          : `Plan generated: ${result.added.length} added, ${result.updated.length} updated, ${result.merged.length} config merges, ${result.removed.length} removed, ${result.already_current.length} already current, ${result.conflicts.length} conflicts.`,
       )
       await refreshBackups()
     } catch (error) {
@@ -705,7 +729,11 @@ function App() {
       })
       setLastApply(result)
       setPlan(result.plan)
-      setMessage(locale === 'zh' ? `更新完成。备份 ID：${result.backup_id}。冲突：${result.plan.conflicts.length}。` : `Update complete. Backup ID: ${result.backup_id}. Conflicts: ${result.plan.conflicts.length}.`)
+      setMessage(
+        result.backup_id
+          ? locale === 'zh' ? `更新完成。备份 ID：${result.backup_id}。冲突：${result.plan.conflicts.length}。` : `Update complete. Backup ID: ${result.backup_id}. Conflicts: ${result.plan.conflicts.length}.`
+          : locale === 'zh' ? `无需更新。实例中的受管理文件已经是目标版本。` : `No update required. Managed files in the instance already match the target version.`,
+      )
       await refreshBackups()
     } catch (error) {
       setMessage(String(error))
@@ -970,7 +998,7 @@ function App() {
               <span>{copy.compare}</span>
               <small>{copy.generatePlan}</small>
             </button>
-            <button type="button" className="action-button" onClick={runApply} disabled={!canPreview || !plan}>
+            <button type="button" className="action-button" onClick={runApply} disabled={!canExecutePlan}>
               <FileArchive size={18} />
               <span>{copy.createBackup}</span>
               <small>{locale === 'zh' ? '保护已修改文件' : 'Protect modified files'}</small>
@@ -1047,14 +1075,19 @@ function App() {
                 <InfoRow label={locale === 'zh' ? '新源包' : 'New Source'} value={newSource || (locale === 'zh' ? '未选择' : 'Not selected')} />
                 <InfoRow label={locale === 'zh' ? '当前' : 'Current'} value={plan?.from ?? copy.notScanned} />
                 <InfoRow label={copy.target} value={plan?.to ?? copy.notScanned} />
-                {lastApply && <InfoRow label={copy.lastBackup} value={lastApply.backup_id} />}
+                {lastApply && <InfoRow label={copy.lastBackup} value={lastApply.backup_id ?? (locale === 'zh' ? '无需备份' : 'No backup needed')} />}
+              </section>
+
+              <section className="panel operation-log-panel">
+                <PanelHeader title={locale === 'zh' ? '执行日志' : 'Operation Log'} subtitle={lastApply ? (locale === 'zh' ? '最近执行' : 'Latest run') : (plan ? (locale === 'zh' ? '计划日志' : 'Plan log') : copy.waiting)} />
+                <OperationLogView logs={lastApply?.logs ?? plan?.logs ?? []} locale={locale} />
               </section>
 
             </aside>
           </section>
 
           <footer className="execute-bar">
-            <button type="button" className="execute-button" onClick={runApply} disabled={!canPreview || !plan}>
+            <button type="button" className="execute-button" onClick={runApply} disabled={!canExecutePlan}>
               <Rocket size={20} />
               <span>{copy.executePlan}</span>
               <small>{copy.backupFirst}</small>
@@ -1160,7 +1193,7 @@ function App() {
                     <span>{copy.generatePlan}</span>
                     <small>{copy.buildPlanActions}</small>
                   </button>
-                  <button type="button" className="action-button" onClick={runApply} disabled={!canPreview || !plan}>
+                  <button type="button" className="action-button" onClick={runApply} disabled={!canExecutePlan}>
                     <Rocket size={18} />
                     <span>{copy.executePlan}</span>
                     <small>{copy.backupThenWrite}</small>
@@ -1171,6 +1204,7 @@ function App() {
                 <PanelHeader title={copy.planDetails} subtitle={locale === 'zh' ? `${totals.changed} 个变更，${totals.conflicts} 个冲突` : `${totals.changed} changed, ${totals.conflicts} conflicts`} />
                 <Stepper conflicts={totals.conflicts} hasPlan={Boolean(plan)} locale={locale} />
                 <ConflictList plan={plan} locale={locale} />
+                <OperationLogView logs={lastApply?.logs ?? plan?.logs ?? []} locale={locale} />
               </section>
             </section>
           )}
@@ -1407,6 +1441,7 @@ function DiffView({ plan, copy }: { plan: UpdatePlan | null; copy: typeof i18n.z
     { tone: 'amber', title: copy.updatedFiles, count: plan.updated.length + plan.renamed.length, items: [...plan.updated.map((item) => item.path), ...plan.renamed.map((item) => `${item.from} -> ${item.to}`)] },
     { tone: 'blue', title: copy.mergedConfigs, count: plan.merged.length, items: plan.merged.map((item) => item.path) },
     { tone: 'red', title: copy.removedFiles, count: plan.removed.length, items: plan.removed.map((item) => item.path) },
+    { tone: 'green', title: copy.dashboard === '仪表盘' ? '已是最新' : 'Already Current', count: plan.already_current.length, items: plan.already_current.map((item) => item.path) },
     { tone: 'violet', title: copy.protectedUserFiles, count: plan.preserved.length, items: plan.preserved },
   ]
 
@@ -1475,6 +1510,28 @@ function DiffResultView({ compareResult, copy }: { compareResult: CompareResult 
         ))}
       </div>
     </div>
+  )
+}
+
+function OperationLogView({ logs, locale }: { logs: OperationLog[]; locale: Locale }) {
+  if (!logs.length) {
+    return (
+      <div className="inline-empty">
+        <FileArchive size={17} />
+        {locale === 'zh' ? '生成计划或执行更新后会显示逐步日志。' : 'Generate a plan or run an update to see step-by-step logs.'}
+      </div>
+    )
+  }
+
+  return (
+    <ol className="operation-log">
+      {logs.slice(-12).map((log, index) => (
+        <li className={log.level} key={`${index}:${log.message}`}>
+          <span>{log.level.toUpperCase()}</span>
+          <p>{log.message}</p>
+        </li>
+      ))}
+    </ol>
   )
 }
 

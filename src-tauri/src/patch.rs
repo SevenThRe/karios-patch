@@ -19,8 +19,10 @@ pub struct UpdatePlan {
     pub merged: Vec<FileAction>,
     pub renamed: Vec<RenameAction>,
     pub preserved: Vec<String>,
+    pub already_current: Vec<FileAction>,
     pub conflicts: Vec<Conflict>,
     pub backup_candidates: Vec<String>,
+    pub logs: Vec<OperationLog>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,10 +45,25 @@ pub struct Conflict {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationLog {
+    pub level: LogLevel,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyResult {
-    pub backup_id: String,
+    pub backup_id: Option<String>,
     pub plan: UpdatePlan,
     pub state_path: String,
+    pub logs: Vec<OperationLog>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,19 +91,32 @@ pub fn build_plan(
         merged: Vec::new(),
         renamed: Vec::new(),
         preserved: Vec::new(),
+        already_current: Vec::new(),
         conflicts: Vec::new(),
         backup_candidates: Vec::new(),
+        logs: Vec::new(),
     };
+    plan.log_info(format!(
+        "Scanned update context: {} -> {}",
+        old_manifest.version, new_manifest.version
+    ));
 
     for file in &diff.added {
         if is_apply_managed(file) {
             let target = resolve_safe(instance_dir, &file.path)?;
             if target.exists() {
-                plan.conflicts.push(Conflict {
-                    path: file.path.clone(),
-                    reason: "用户实例中已存在同名文件，保留用户文件".to_string(),
-                });
+                let current_hash = sha256_file(&target)?;
+                if current_hash == file.sha256 {
+                    plan.mark_current(file);
+                } else {
+                    plan.log_warn(format!("Conflict: local file already exists for new official file {}", file.path));
+                    plan.conflicts.push(Conflict {
+                        path: file.path.clone(),
+                        reason: "用户实例中已存在同名文件，保留用户文件".to_string(),
+                    });
+                }
             } else {
+                plan.log_info(format!("Plan add: {}", file.path));
                 plan.added.push(FileAction {
                     path: file.path.clone(),
                     sha256: Some(file.sha256.clone()),
@@ -114,13 +144,17 @@ pub fn build_plan(
                 continue;
             }
             let current_hash = sha256_file(&target)?;
-            if current_hash == old.sha256 {
+            if current_hash == new.sha256 {
+                plan.mark_current(new);
+            } else if current_hash == old.sha256 {
                 plan.backup_candidates.push(old.path.clone());
+                plan.log_info(format!("Plan replace: {}", new.path));
                 plan.updated.push(FileAction {
                     path: new.path.clone(),
                     sha256: Some(new.sha256.clone()),
                 });
             } else {
+                plan.log_warn(format!("Conflict: local official file changed by user {}", old.path));
                 plan.conflicts.push(Conflict {
                     path: old.path.clone(),
                     reason: "用户修改过官方文件，保留本地文件，新官方文件写入冲突目录".to_string(),
@@ -137,14 +171,18 @@ pub fn build_plan(
         if is_apply_managed(old) && is_apply_managed(new) {
             let old_target = resolve_safe(instance_dir, &old.path)?;
             let new_target = resolve_safe(instance_dir, &new.path)?;
-            if old_target.exists() && sha256_file(&old_target)? == old.sha256 && !new_target.exists() {
+            if new_target.exists() && sha256_file(&new_target)? == new.sha256 && !old_target.exists() {
+                plan.mark_current(new);
+            } else if old_target.exists() && sha256_file(&old_target)? == old.sha256 && !new_target.exists() {
                 plan.backup_candidates.push(old.path.clone());
+                plan.log_info(format!("Plan rename: {} -> {}", old.path, new.path));
                 plan.renamed.push(RenameAction {
                     from: old.path.clone(),
                     to: new.path.clone(),
                     sha256: new.sha256.clone(),
                 });
             } else {
+                plan.log_warn(format!("Conflict: rename is not safe {} -> {}", old.path, new.path));
                 plan.conflicts.push(Conflict {
                     path: old.path.clone(),
                     reason: "重命名目标不安全或原文件已被用户修改".to_string(),
@@ -156,6 +194,12 @@ pub fn build_plan(
     }
 
     dedupe(&mut plan.backup_candidates);
+    plan.log_info(format!(
+        "Plan summary: {} executable actions, {} already current, {} conflicts",
+        plan.executable_action_count(),
+        plan.already_current.len(),
+        plan.conflicts.len()
+    ));
     Ok(plan)
 }
 
@@ -172,6 +216,37 @@ pub fn apply_update(instance_dir: &Path, old_source: &Path, new_source: &Path, o
         None => state::build_state(&old_manifest, manifest_digest(&old_manifest)?),
     };
 
+    if !plan.has_work() {
+        plan.log_info("No update actions required; instance already matches the target managed files.");
+        current_state = state::build_state(&new_manifest, manifest_sha);
+        current_state.backups = state::read_state(instance_dir)?
+            .map(|state| state.backups)
+            .unwrap_or_default();
+        track_merged_configs(&mut current_state, &new_manifest, &plan);
+        write_manifest(
+            &instance_dir
+                .join(".packdelta")
+                .join("manifests")
+                .join(format!("{}.json", old_manifest.version)),
+            &old_manifest,
+        )?;
+        write_manifest(
+            &instance_dir
+                .join(".packdelta")
+                .join("manifests")
+                .join(format!("{}.json", new_manifest.version)),
+            &new_manifest,
+        )?;
+        state::write_state(instance_dir, &current_state)?;
+        let logs = plan.logs.clone();
+        return Ok(ApplyResult {
+            backup_id: None,
+            plan,
+            state_path: state::state_path(instance_dir).display().to_string(),
+            logs,
+        });
+    }
+
     let backup_id = backup::make_backup_id(&old_manifest.version, &new_manifest.version);
     let mut backup_files = Vec::new();
     for path in &plan.backup_candidates {
@@ -187,38 +262,45 @@ pub fn apply_update(instance_dir: &Path, old_source: &Path, new_source: &Path, o
         }
     }
     backup::create_backup(instance_dir, &backup_id, &old_manifest.version, &new_manifest.version, backup_files, &current_state)?;
+    plan.log_info(format!("Created backup: {}", backup_id));
 
-    for action in &plan.removed {
+    for action in plan.removed.clone() {
         let target = resolve_safe(instance_dir, &action.path)?;
         if target.exists() {
             fs::remove_file(target)?;
+            plan.log_info(format!("Removed: {}", action.path));
         }
     }
 
-    for action in &plan.renamed {
+    for action in plan.renamed.clone() {
         let from = resolve_safe(instance_dir, &action.from)?;
         let to = resolve_safe(instance_dir, &action.to)?;
         ensure_parent(&to)?;
         fs::rename(from, to)?;
+        plan.log_info(format!("Renamed: {} -> {}", action.from, action.to));
     }
 
-    for update in &plan.updated {
+    for update in plan.updated.clone() {
         copy_from_source(new_source, instance_dir, &update.path, update.sha256.as_deref())?;
+        plan.log_info(format!("Updated: {}", update.path));
     }
-    for merge in &plan.merged {
+    for merge in plan.merged.clone() {
         merge_config_file(old_source, new_source, instance_dir, &merge.path, merge.sha256.as_deref())?;
+        plan.log_info(format!("Merged config: {}", merge.path));
     }
-    for add in &plan.added {
+    for add in plan.added.clone() {
         copy_from_source(new_source, instance_dir, &add.path, add.sha256.as_deref())?;
+        plan.log_info(format!("Added: {}", add.path));
     }
 
-    for conflict in &plan.conflicts {
+    for conflict in plan.conflicts.clone() {
         if let Some(new_file) = new_manifest.files.iter().find(|file| file.path == conflict.path) {
             let conflict_root = instance_dir
                 .join(".packdelta")
                 .join("conflicts")
                 .join(format!("{}_to_{}", old_manifest.version, new_manifest.version));
             copy_from_source(new_source, &conflict_root, &new_file.path, Some(&new_file.sha256))?;
+            plan.log_warn(format!("Wrote conflict candidate: {}", new_file.path));
         }
     }
     write_conflict_notes(instance_dir, &old_manifest.version, &new_manifest.version, &plan)?;
@@ -250,11 +332,14 @@ pub fn apply_update(instance_dir: &Path, old_source: &Path, new_source: &Path, o
     ));
     state::write_state(instance_dir, &current_state)?;
     plan.conflicts.sort_by(|a, b| a.path.cmp(&b.path));
+    plan.log_info(format!("Wrote state: {}", state::state_path(instance_dir).display()));
+    let logs = plan.logs.clone();
 
     Ok(ApplyResult {
-        backup_id,
+        backup_id: Some(backup_id),
         plan,
         state_path: state::state_path(instance_dir).display().to_string(),
+        logs,
     })
 }
 
@@ -308,20 +393,19 @@ fn handle_removed(instance_dir: &Path, file: &ManifestFile, plan: &mut UpdatePla
     }
     let target = resolve_safe(instance_dir, &file.path)?;
     if !target.exists() {
-        plan.removed.push(FileAction {
-            path: file.path.clone(),
-            sha256: Some(file.sha256.clone()),
-        });
+        plan.mark_current(file);
         return Ok(());
     }
     let current_hash = sha256_file(&target)?;
     if current_hash == file.sha256 {
         plan.backup_candidates.push(file.path.clone());
+        plan.log_info(format!("Plan remove: {}", file.path));
         plan.removed.push(FileAction {
             path: file.path.clone(),
             sha256: Some(file.sha256.clone()),
         });
     } else {
+        plan.log_warn(format!("Conflict: remove target was changed locally {}", file.path));
         plan.conflicts.push(Conflict {
             path: file.path.clone(),
             reason: "删除目标已被用户修改，保留本地文件".to_string(),
@@ -333,12 +417,19 @@ fn handle_removed(instance_dir: &Path, file: &ManifestFile, plan: &mut UpdatePla
 fn handle_added_config(instance_dir: &Path, file: &ManifestFile, plan: &mut UpdatePlan) -> AppResult<()> {
     let target = resolve_safe(instance_dir, &file.path)?;
     if target.exists() {
-        plan.backup_candidates.push(file.path.clone());
-        plan.conflicts.push(Conflict {
-            path: file.path.clone(),
-            reason: "新官方 config 与本地同名配置冲突，需要手动选择保留本地或采用官方文件".to_string(),
-        });
+        let current_hash = sha256_file(&target)?;
+        if current_hash == file.sha256 {
+            plan.mark_current(file);
+        } else {
+            plan.backup_candidates.push(file.path.clone());
+            plan.log_warn(format!("Conflict: new official config collides with local config {}", file.path));
+            plan.conflicts.push(Conflict {
+                path: file.path.clone(),
+                reason: "新官方 config 与本地同名配置冲突，需要手动选择保留本地或采用官方文件".to_string(),
+            });
+        }
     } else {
+        plan.log_info(format!("Plan add config: {}", file.path));
         plan.merged.push(FileAction {
             path: file.path.clone(),
             sha256: Some(file.sha256.clone()),
@@ -405,22 +496,61 @@ fn handle_updated_config(
 
     let current_hash = sha256_file(&target)?;
     if current_hash == new.sha256 {
+        plan.mark_current(new);
         return Ok(());
     }
     plan.backup_candidates.push(old.path.clone());
     let can_auto_merge = can_merge_config(old_source, new_source, instance_dir, &old.path).unwrap_or(false);
     if current_hash == old.sha256 || can_auto_merge {
+        plan.log_info(format!("Plan merge config: {}", new.path));
         plan.merged.push(FileAction {
             path: new.path.clone(),
             sha256: Some(new.sha256.clone()),
         });
     } else {
+        plan.log_warn(format!("Conflict: config changed both locally and officially {}", old.path));
         plan.conflicts.push(Conflict {
             path: old.path.clone(),
             reason: "本地 config 与新版官方 config 修改了同一位置，需要手动决策".to_string(),
         });
     }
     Ok(())
+}
+
+impl UpdatePlan {
+    fn executable_action_count(&self) -> usize {
+        self.added.len()
+            + self.removed.len()
+            + self.updated.len()
+            + self.merged.len()
+            + self.renamed.len()
+    }
+
+    fn has_work(&self) -> bool {
+        self.executable_action_count() > 0 || !self.conflicts.is_empty()
+    }
+
+    fn mark_current(&mut self, file: &ManifestFile) {
+        self.already_current.push(FileAction {
+            path: file.path.clone(),
+            sha256: Some(file.sha256.clone()),
+        });
+        self.log_info(format!("Already current: {}", file.path));
+    }
+
+    fn log_info(&mut self, message: impl Into<String>) {
+        self.logs.push(OperationLog {
+            level: LogLevel::Info,
+            message: message.into(),
+        });
+    }
+
+    fn log_warn(&mut self, message: impl Into<String>) {
+        self.logs.push(OperationLog {
+            level: LogLevel::Warn,
+            message: message.into(),
+        });
+    }
 }
 
 fn is_apply_managed(file: &ManifestFile) -> bool {
@@ -662,7 +792,7 @@ mod tests {
         let new_manifest = scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
 
         let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
-        rollback(&instance, &result.backup_id).unwrap();
+        rollback(&instance, result.backup_id.as_deref().unwrap()).unwrap();
 
         assert_eq!(fs::read(instance.join("mods/a.jar")).unwrap(), b"old-a");
         assert_eq!(fs::read(instance.join("mods/remove.jar")).unwrap(), b"remove-me");
@@ -765,9 +895,42 @@ mod tests {
         let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
         assert!(instance.join("config/new.toml").exists());
 
-        rollback(&instance, &result.backup_id).unwrap();
+        rollback(&instance, result.backup_id.as_deref().unwrap()).unwrap();
 
         assert!(!instance.join("config/new.toml").exists());
+    }
+
+    #[test]
+    fn preview_and_apply_skip_files_that_already_match_target_manifest() {
+        let temp = tempdir().unwrap();
+        let old_source = temp.path().join("old");
+        let new_source = temp.path().join("new");
+        let instance = temp.path().join("instance");
+
+        write_file(&old_source, "mods/a.jar", b"old-a");
+        write_file(&old_source, "mods/removed.jar", b"removed");
+        write_file(&old_source, "config/app.toml", b"limit=1\n");
+        write_file(&new_source, "mods/a.jar", b"new-a");
+        write_file(&new_source, "mods/b.jar", b"new-b");
+        write_file(&new_source, "config/app.toml", b"limit=2\n");
+        write_file(&instance, "mods/a.jar", b"new-a");
+        write_file(&instance, "mods/b.jar", b"new-b");
+        write_file(&instance, "config/app.toml", b"limit=2\n");
+
+        let old_manifest = scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest = scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+        let diff = crate::diff::compare(&old_manifest, &new_manifest);
+        let plan = build_plan(&instance, &old_source, &new_source, &old_manifest, &new_manifest, &diff).unwrap();
+
+        assert_eq!(plan.executable_action_count(), 0);
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.already_current.len(), 4);
+
+        let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
+
+        assert!(result.backup_id.is_none());
+        assert_eq!(result.plan.executable_action_count(), 0);
+        assert!(result.logs.iter().any(|log| log.message.contains("No update actions required")));
     }
 
     #[test]
