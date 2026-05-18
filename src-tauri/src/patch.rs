@@ -809,6 +809,23 @@ mod tests {
         assert!(result.plan.conflicts.is_empty());
     }
 
+    #[test]
+    fn directory_sources_normalize_curseforge_overrides_paths() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+
+        write_file(&source, "overrides/mods/a.jar", b"a");
+        write_file(&source, "overrides/config/app.toml", b"enabled=true\n");
+        write_file(&source, "overrides/kubejs/server_scripts/main.js", b"ServerEvents.loaded(() => {})\n");
+
+        let manifest = scan_pack_source(&source, None, None, Some("1.0.0".to_string())).unwrap();
+
+        assert!(manifest.files.iter().any(|file| file.path == "mods/a.jar"));
+        assert!(manifest.files.iter().any(|file| file.path == "config/app.toml"));
+        assert!(manifest.files.iter().any(|file| file.path == "kubejs/server_scripts/main.js"));
+        assert!(!manifest.files.iter().any(|file| file.path.starts_with("overrides/")));
+    }
+
     fn write_file(root: &Path, relative: &str, content: &[u8]) {
         let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
         fs::create_dir_all(path.parent().unwrap()).unwrap();

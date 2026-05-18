@@ -89,7 +89,7 @@ pub fn scan_pack_source(
         if !path.is_file() {
             continue;
         }
-        let rel = normalize_relative(root, path)?;
+        let rel = normalize_source_relative(root, path)?;
         if should_skip(&rel) {
             continue;
         }
@@ -155,7 +155,7 @@ pub fn write_manifest(path: &Path, manifest: &PackManifest) -> AppResult<()> {
     Ok(())
 }
 
-fn normalize_relative(root: &Path, path: &Path) -> AppResult<String> {
+fn normalize_source_relative(root: &Path, path: &Path) -> AppResult<String> {
     let rel = path
         .strip_prefix(root)
         .map_err(|_| crate::error::AppError::UnsafePath(path.display().to_string()))?;
@@ -166,7 +166,7 @@ fn normalize_relative(root: &Path, path: &Path) -> AppResult<String> {
             _ => None,
         })
         .collect();
-    Ok(parts.join("/"))
+    normalize_pack_parts(&parts).ok_or_else(|| AppError::UnsafePath(path.display().to_string()))
 }
 
 fn scan_zip_pack_source(
@@ -271,6 +271,16 @@ fn normalize_zip_entry_name(name: &str) -> Option<String> {
         return None;
     }
 
+    normalize_pack_parts(&parts)
+}
+
+fn normalize_pack_parts(parts: &[String]) -> Option<String> {
+    if parts.is_empty() {
+        return None;
+    }
+    if parts[0].eq_ignore_ascii_case("overrides") && parts.len() > 1 {
+        return Some(parts[1..].join("/"));
+    }
     let start = parts
         .iter()
         .position(|part| is_known_pack_root(part))
