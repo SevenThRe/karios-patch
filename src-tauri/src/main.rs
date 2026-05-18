@@ -5,6 +5,7 @@ mod error;
 mod hash;
 mod manifest;
 mod patch;
+mod preferences;
 mod state;
 mod updater;
 
@@ -20,9 +21,12 @@ fn main() {
             commands::list_backups,
             commands::rollback,
             commands::open_folder,
+            commands::load_app_preferences,
+            commands::save_app_preferences,
             commands::load_update_source,
             commands::save_update_source,
             commands::check_app_update,
+            commands::fetch_changelog,
             commands::download_app_update,
             commands::install_portable_update
         ])

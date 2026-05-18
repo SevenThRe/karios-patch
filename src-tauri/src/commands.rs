@@ -4,7 +4,8 @@ use crate::{
     error::AppResult,
     manifest::{PackManifest, scan_pack_source as scan_source},
     patch::{self, ApplyResult, RollbackResult, UpdatePlan},
-    updater::{self, AppRelease, AppUpdateCheck, DownloadedUpdate, PortableInstallPlan, UpdateSourceConfig},
+    preferences::{self, AppPreferences},
+    updater::{self, AppRelease, AppUpdateCheck, ChangelogRelease, DownloadedUpdate, PortableInstallPlan, UpdateSourceConfig},
 };
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
@@ -117,6 +118,16 @@ pub fn open_folder(path: String) -> AppResult<()> {
 }
 
 #[tauri::command]
+pub fn load_app_preferences() -> AppResult<AppPreferences> {
+    preferences::load()
+}
+
+#[tauri::command]
+pub fn save_app_preferences(preferences: AppPreferences) -> AppResult<AppPreferences> {
+    preferences::save(preferences)
+}
+
+#[tauri::command]
 pub fn load_update_source() -> AppResult<Option<UpdateSourceConfig>> {
     updater::load_source()
 }
@@ -129,6 +140,11 @@ pub fn save_update_source(index_url: String) -> AppResult<UpdateSourceConfig> {
 #[tauri::command]
 pub fn check_app_update(index_url: String) -> AppResult<AppUpdateCheck> {
     updater::check(&index_url, env!("CARGO_PKG_VERSION"))
+}
+
+#[tauri::command]
+pub fn fetch_changelog(index_url: String) -> AppResult<Vec<ChangelogRelease>> {
+    updater::changelog(&index_url)
 }
 
 #[tauri::command]

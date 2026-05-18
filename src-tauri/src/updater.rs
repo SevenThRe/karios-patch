@@ -67,6 +67,26 @@ pub struct PortableInstallPlan {
     pub script_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangelogRelease {
+    pub version: String,
+    pub title: String,
+    pub body: String,
+    pub published_at: Option<String>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    published_at: Option<String>,
+    html_url: String,
+    draft: bool,
+    prerelease: bool,
+}
+
 pub fn config_path() -> AppResult<PathBuf> {
     let base = dirs::config_dir()
         .ok_or_else(|| AppError::Message("无法定位用户配置目录".to_string()))?
@@ -115,6 +135,41 @@ pub fn check(index_url: &str, current_version: &str) -> AppResult<AppUpdateCheck
         update_available,
         release: update_available.then_some(latest).flatten(),
     })
+}
+
+pub fn changelog(index_url: &str) -> AppResult<Vec<ChangelogRelease>> {
+    validate_url(index_url)?;
+    let (owner, repo) = github_repo_from_update_source(index_url)
+        .ok_or_else(|| AppError::Message("无法从 GitHub 更新源识别仓库".to_string()))?;
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=20");
+    let client = reqwest::blocking::Client::new();
+    let releases: Vec<GitHubRelease> = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "KairosPatch")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    Ok(releases
+        .into_iter()
+        .filter(|release| !release.draft)
+        .map(|release| ChangelogRelease {
+            version: release.tag_name.clone(),
+            title: release.name.unwrap_or(release.tag_name),
+            body: release
+                .body
+                .unwrap_or_else(|| {
+                    if release.prerelease {
+                        "Prerelease published without release notes.".to_string()
+                    } else {
+                        "Release published without release notes.".to_string()
+                    }
+                }),
+            published_at: release.published_at,
+            url: release.html_url,
+        })
+        .collect())
 }
 
 pub fn download(release: AppRelease) -> AppResult<DownloadedUpdate> {
@@ -199,6 +254,19 @@ fn validate_url(url: &str) -> AppResult<()> {
         Ok(())
     } else {
         msg("更新源必须使用 https:// URL")
+    }
+}
+
+fn github_repo_from_update_source(url: &str) -> Option<(String, String)> {
+    let marker = "github.com/";
+    let after_host = url.split_once(marker)?.1;
+    let mut parts = after_host.split('/');
+    let owner = parts.next()?.to_string();
+    let repo = parts.next()?.to_string();
+    if owner.is_empty() || repo.is_empty() {
+        None
+    } else {
+        Some((owner, repo))
     }
 }
 
