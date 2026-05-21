@@ -1,0 +1,83 @@
+name: Kairos Patch feedback
+description: Report a bug, failed install/update, or product suggestion.
+title: "[Feedback] "
+labels:
+  - feedback
+body:
+  - type: dropdown
+    id: issue_type
+    attributes:
+      label: 问题类型
+      options:
+        - Bug
+        - 建议
+        - 安装失败
+        - 更新失败
+        - 其他
+    validations:
+      required: true
+  - type: input
+    id: title
+    attributes:
+      label: 标题
+      placeholder: 例如：更新到 0.1.2 后启动失败
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 描述
+      placeholder: 说明你看到的现象、期望结果和实际结果。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction_steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开 Kairos Patch
+        2. 选择实例和目标包
+        3. 点击开始更新
+    validations:
+      required: false
+  - type: checkboxes
+    id: upload_consent
+    attributes:
+      label: 上传内容
+      options:
+        - label: 是否上传日志
+        - label: 是否上传配置
+  - type: textarea
+    id: attachments
+    attributes:
+      label: 截图/附件
+      description: Drag screenshots, logs, or the generated diagnostic zip here.
+    validations:
+      required: false
+  - type: input
+    id: contact
+    attributes:
+      label: 联系方式：可选
+      placeholder: Email, GitHub ID, or another contact method.
+    validations:
+      required: false
+  - type: textarea
+    id: automatic_metadata
+    attributes:
+      label: 自动附带
+      description: Paste the generated Automatic Metadata JSON from `github-issue-body.md` when using the desktop feedback package.
+      render: json
+      placeholder: |
+        {
+          "toolName": "Kairos Patch",
+          "toolVersion": "0.1.0",
+          "patchVersion": "current patch version",
+          "os": "Windows 10/11",
+          "arch": "x64",
+          "javaVersion": "17",
+          "errorHash": "error fingerprint",
+          "logTail": "recent 500 log lines",
+          "configSnapshot": "redacted config"
+        }
+    validations:
+      required: false

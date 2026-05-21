@@ -24,9 +24,10 @@
       <stop offset="1" stop-color="#168D54"/>
     </linearGradient>
     <filter id="kp-shadow" x="7" y="6" width="67" height="70" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse">
-      <feDropShadow dx="0" dy="8" stdDeviation="6" flood-color="#071013" flood-opacity=".28"/>
+      <feDropShadow dx="0" dy="8" stdDeviation="6" flood-color="#000000" flood-opacity=".44"/>
     </filter>
   </defs>
+  <rect width="80" height="80" rx="18" fill="#202123"/>
   <g filter="url(#kp-shadow)">
     <path d="M18 20L42 8V34L18 45V20Z" fill="url(#kp-blue-a)"/>
     <path d="M18 20L42 8V19L30 30L18 25V20Z" fill="#9AB7BE" opacity=".52"/>

@@ -1,0 +1,61 @@
+# Progress
+
+## 2026-05-21
+
+- Fixed the first three production-release blockers: official-only update index/asset validation, SemVer-only update cache path components with install-time path/SHA revalidation, and Tauri CSP plus frontend opener permission reduction.
+- Added Rust regression coverage for official update source acceptance, foreign update source rejection, portable asset version/repo matching, unsafe version path rejection, release-index app_id mismatch, and SHA256 format validation.
+- Verified the blocker fixes with `cargo fmt --manifest-path src-tauri\Cargo.toml`, `cargo test --manifest-path src-tauri\Cargo.toml`, `npm run build`, `npm run lint`, `npm audit --json`, `npm run tauri:build`, and `npm run portable:release`; the rebuilt portable SHA256 is `847d84ee9431e40ce5c2e5c26073ae8f94ef34d0206db0a2000227cd0b63cb9c`.
+- Removed unused `App.tsx` derived variables that were blocking the final lint and release build verification.
+- Reviewed the current KairosPatch code from a production-release security and performance angle, focusing on the Tauri trust boundary, portable self-update path, diagnostics package, large ZIP handling, dependency posture, and release automation gaps.
+- Verified the current tree with `npm run lint`, `npm run build`, `cargo test --manifest-path src-tauri\Cargo.toml`, `npm audit --json`, `cargo tree --manifest-path src-tauri\Cargo.toml -d`, `npm run tauri:build`, and `npm run portable:release`; `cargo audit` is not installed in this environment.
+- Rebuilt the current 0.1.2 portable package during the audit; `dist-portable/KairosPatch-release-portable.zip` SHA256 is `e26c4bf85eee941c46019c5e25f87aadeefd0421bbc7e9a58a5a9b1b2301ca39`.
+- Reviewed current product, implementation, security, and delivery gaps for KairosPatch, with verification from lint, build, Rust tests, and npm audit.
+- Added visible operation progress feedback for source comparison, update-plan generation, protected update execution, and rollback.
+- Kept final success/error state visible after a long operation so users can tell whether the click completed.
+- Changed silent backup refreshes after apply/rollback so completion messages are not overwritten by backup-list refresh text.
+- Reworked config merge to use line-based three-way ranges from old/local/new content.
+- Added a regression test proving user-inserted config lines are preserved while official non-overlapping changes are applied.
+- Verified with `npm run build`, `npm run lint`, `cargo test`, and a local browser smoke check at `http://127.0.0.1:5173/`.
+- Hid Windows console windows for the release desktop executable and internal PowerShell/tasklist subprocesses.
+- Verified the hidden-console changes with `cargo test`; frontend build is currently blocked by unrelated in-progress `App.tsx` page/type changes.
+- Rebuilt the UI into a single-flow update workbench instead of a dashboard template: only Update, Backups, and Settings remain as primary navigation.
+- Removed KPI cards, stepper, right-side widget stack, and the top-right ready pill.
+- Added a built-in Monaco diff panel backed by a read-only Tauri command that reads old/new source files from folders or ZIP packs.
+- Verified the new workbench with `npm run lint`, `npm run build`, `cargo check`, and Playwright screenshots at `1440x900` and `900x720`.
+- Changed the default update flow to require only the current instance and target pack. The current baseline pack is now an advanced optional input.
+- Added conservative preview planning for no-baseline updates: automatic actions, explicit review items, and protected user assets.
+- Added a review queue UI with per-item choices so local-only mods and changed config files are shown to the user instead of silently kept or removed.
+- Redesigned the Kairos Patch icon set from the provided 3D Kairos K reference: faceted blue/teal left planes, bright green right planes, and dark center cuts.
+- Replaced the web favicon and app rail brand mark, generated PNG raster fallbacks, regenerated `src-tauri/icons/icon.ico`, and verified with `npm run lint` plus `npm run build`.
+- Refined the icon away from the interim box look into a clearer K-shaped mark with Minecraft-grass-block-like color logic and a patch-like broken center cut.
+- Added backend no-baseline conservative apply support with review choices, automatic plan actions, protected asset defaults, backup/state writes, and Rust regression tests.
+- Verified the backend apply path with `cargo check` and `cargo test`; rustfmt could not run because the local stable toolchain is missing the `rustfmt` component.
+- Wired the no-baseline UI apply button to `apply_conservative_update`, passing review choices and refreshing the conservative preview after completion.
+- Replaced the default Vite README with Kairos Patch product, update-mode, rollback, development, and portable packaging documentation.
+- Verified the integrated frontend/backend changes with `npm run lint`, `npm run build`, and `cargo test`.
+- Verified responsive layout with headless Chromium at 980, 900, 720, 560, and 360 px; all checked widths reported zero horizontal overflow.
+- Installed the missing `rustfmt` component, ran `cargo fmt`, and re-verified the Rust backend with `cargo test`.
+- Ran release readiness checks: `npm run lint`, `npm run build`, `cargo test`, `npm run tauri:build`, and `npm run portable:release` passed; `npm audit --audit-level=moderate` still reports the known Monaco/DOMPurify moderate findings.
+- Built fresh 0.1.2 release artifacts: MSI, NSIS setup executable, and `dist-portable/KairosPatch-release-portable.zip` with SHA256 `dadcfed04caad7adfdb79eec4c81dafbb39105444e2c231d148418e3d317fb70`.
+- Resolved the Monaco/DOMPurify audit blocker by pinning `monaco-editor` to `0.53.0`, which removes the vulnerable transitive `dompurify` dependency while remaining compatible with `@monaco-editor/react`.
+- Verified the Monaco dependency change with `npm audit --audit-level=moderate`, `npm run lint`, `npm run build`, a headless Chromium runtime smoke check, `npm run tauri:build`, and `npm run portable:release`.
+- Rebuilt clean-audit 0.1.2 release artifacts; the current portable zip SHA256 is `38b0e0d37f084f17e2471fecf4dfc2cc9503fe5c9f688434a8dfd3b703cbd491`.
+- Prepared the external update assets locally under ignored `dist-portable/`: updated `release-index.json` to latest `0.1.2`, copied `KairosPatch-v0.1.2-portable.zip`, and wrote the matching SHA256 sidecar.
+- Updated `docs/github-update-source.md` so the documented release asset names, URL, SHA256, and size match the 0.1.2 portable package.
+- Rechecked release-index JSON validity, non-English code-comment scan, whitespace, and npm audit after the release asset preparation.
+- Added feedback diagnostics: persistent app log JSONL, local diagnostic zip generation, prefilled GitHub Issue URL generation, and Settings-page feedback controls.
+- Documented feedback diagnostics in README and kept the first feedback release privacy-preserving: no silent upload, user decides whether to attach the local zip.
+- Rebuilt 0.1.2 release artifacts after diagnostics; the current portable zip SHA256 is `d4d99e1ecb1c5407b36b7d2957634358b8cf731167420556f52750f7be2c824e`.
+- Reworked feedback into a GitHub Issue Form template plus an in-app feedback form with issue type, title, description, reproduction steps, explicit log/config upload toggles, selected attachments, and optional contact.
+- Expanded local diagnostics to generate `report.json`, `github-issue-body.md`, opt-in app logs, opt-in redacted config snapshot, Java/Windows/arch metadata, patch version, error hash, and selected attachments.
+- Re-verified structured feedback with `cargo fmt`, `cargo test`, `npm run lint`, `npm run build`, `npm audit --audit-level=moderate`, and `npm run tauri:build`.
+- Rebuilt 0.1.2 portable assets after structured feedback; the current portable zip SHA256 is `9728eb38772d19960d2da5ee5c3f14cd4d0469f29980fefebb258bb5ec0377a9`.
+- Rebuilt the 0.1.2 portable package after the locked local instance was closed; the current portable zip SHA256 is `21c97f4211097137a951ece018f12753e932e1ded2c018296f68f0037c0c8db8`.
+- Confirmed the current capability boundary: baseline mode supports current instance plus old and target official packs; conservative mode supports current instance plus target pack when no old official pack is available.
+- Added shared Minecraft instance-directory validation for baseline and no-baseline updates, covering `.minecraft` roots and version-isolated game directories.
+- Added drag-and-drop path support to the current instance, target pack, and optional baseline pack pickers to reduce picker-button steps.
+- Added tracked update execution with Tauri progress events, a visible operation toast, measured progress for write steps, failure state, and recent update logs on the main update page.
+- Optimized large-pack handling by scanning ZIP sources from `File` instead of reading the whole archive into memory, hashing ZIP entries through streaming reads, emitting real scan file-count progress, and including supplemental backup files in baseline progress totals.
+- Verified the current v0.1.2-beta release-candidate build chain with `npm run lint`, `npm run build`, `cargo test`, `npm run tauri:build`, and `npm run portable:release`; the portable zip SHA256 is `5a68c67a1b0171b72047246ab2eab4dbfadd9ae1df69073ee911b3875983e9a1`.
+- Reworked the update page into a compact desktop utility layout: toolbar, inline source fields, split changes list, diff pane, row-level review choices, and a bottom status bar.
+- Verified the split-pane utility UI with `npm run lint`, `npm run build`, and a local browser smoke check at `http://127.0.0.1:5177/`.

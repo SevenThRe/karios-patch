@@ -12,8 +12,8 @@ Recommended release assets:
 
 ```text
 release-index.json
-KairosPatch-v0.1.1-portable.zip
-KairosPatch-v0.1.1-portable.zip.sha256.json
+KairosPatch-v0.1.2-portable.zip
+KairosPatch-v0.1.2-portable.zip.sha256.json
 ```
 
 `release-index.json`:
@@ -21,23 +21,25 @@ KairosPatch-v0.1.1-portable.zip.sha256.json
 ```json
 {
   "app_id": "kairos-patch",
-  "latest": "0.1.1",
+  "latest": "0.1.2",
   "releases": [
     {
-      "version": "0.1.1",
+      "version": "0.1.2",
       "notes": "Portable update package.",
-      "published_at": "2026-05-18T00:00:00Z",
+      "published_at": "2026-05-21T01:59:34Z",
       "portable": {
-        "url": "https://github.com/SevenThRe/karios-patch/releases/download/v0.1.1/KairosPatch-v0.1.1-portable.zip",
-        "sha256": "PUT_SHA256_HERE",
-        "size": 12345678
+        "url": "https://github.com/SevenThRe/karios-patch/releases/download/v0.1.2/KairosPatch-v0.1.2-portable.zip",
+        "sha256": "847d84ee9431e40ce5c2e5c26073ae8f94ef34d0206db0a2000227cd0b63cb9c",
+        "size": 3575233
       }
     }
   ]
 }
 ```
 
-The application only accepts `https://` update source URLs and verifies the portable zip SHA256 before staging it.
+The application only accepts the official `SevenThRe/karios-patch` GitHub Release update index URL. The index must use `app_id: "kairos-patch"`, the release version must be valid SemVer, and the portable archive URL must point to the matching official GitHub Release asset name.
+
+The portable archive SHA256 is still verified before staging. This protects against transfer corruption and mismatched assets, while the official-source allowlist prevents a custom index from redirecting the updater to an arbitrary publisher.
 
 Portable release workflow:
 
@@ -46,4 +48,4 @@ npm run tauri -- build --release
 npm run portable:release
 ```
 
-Upload the generated zip under `dist-portable/` to GitHub Releases, update `release-index.json`, and upload the index as a release asset. Users can paste the raw `release-index.json` asset URL into Kairos Patch settings.
+Upload the generated zip under `dist-portable/` to GitHub Releases, update `release-index.json`, and upload the index as a release asset. The production update source must remain under `https://github.com/SevenThRe/karios-patch/releases/.../download/release-index.json`.

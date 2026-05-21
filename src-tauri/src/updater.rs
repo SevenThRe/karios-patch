@@ -13,6 +13,13 @@ use std::{
 };
 use zip::ZipArchive;
 
+const UPDATE_APP_ID: &str = "kairos-patch";
+const TRUSTED_GITHUB_HOST: &str = "github.com";
+const TRUSTED_GITHUB_OWNER: &str = "SevenThRe";
+const TRUSTED_GITHUB_REPO: &str = "karios-patch";
+const RELEASE_INDEX_ASSET: &str = "release-index.json";
+const PORTABLE_ARCHIVE_NAME: &str = "kairos-patch-portable.zip";
+
 pub const DEFAULT_UPDATE_SOURCE: &str =
     "https://github.com/SevenThRe/karios-patch/releases/latest/download/release-index.json";
 
@@ -105,7 +112,7 @@ pub fn load_source() -> AppResult<Option<UpdateSourceConfig>> {
 }
 
 pub fn save_source(config: UpdateSourceConfig) -> AppResult<UpdateSourceConfig> {
-    validate_url(&config.index_url)?;
+    validate_update_source_url(&config.index_url)?;
     let path = config_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -115,30 +122,28 @@ pub fn save_source(config: UpdateSourceConfig) -> AppResult<UpdateSourceConfig> 
 }
 
 pub fn check(index_url: &str, current_version: &str) -> AppResult<AppUpdateCheck> {
-    validate_url(index_url)?;
-    let index: ReleaseIndex = reqwest::blocking::get(index_url)?.error_for_status()?.json()?;
-    let latest = index
-        .releases
-        .iter()
-        .find(|release| release.version == index.latest)
-        .cloned()
-        .or_else(|| index.releases.first().cloned());
-    let latest_version = latest
-        .as_ref()
-        .map(|release| release.version.clone())
-        .unwrap_or(index.latest);
+    validate_update_source_url(index_url)?;
+    let index: ReleaseIndex = reqwest::blocking::get(index_url)?
+        .error_for_status()?
+        .json()?;
+    let latest_version = update_version_component(&index.latest)?;
+    let releases = normalize_release_index(index)?;
+    let latest = releases
+        .into_iter()
+        .find(|release| release.version == latest_version)
+        .ok_or_else(|| AppError::Message("更新索引中找不到 latest 对应的 release".to_string()))?;
 
     let update_available = is_newer(&latest_version, current_version);
     Ok(AppUpdateCheck {
         current_version: current_version.to_string(),
         latest_version,
         update_available,
-        release: update_available.then_some(latest).flatten(),
+        release: update_available.then_some(latest),
     })
 }
 
 pub fn changelog(index_url: &str) -> AppResult<Vec<ChangelogRelease>> {
-    validate_url(index_url)?;
+    validate_update_source_url(index_url)?;
     let (owner, repo) = github_repo_from_update_source(index_url)
         .ok_or_else(|| AppError::Message("无法从 GitHub 更新源识别仓库".to_string()))?;
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=20");
@@ -157,15 +162,13 @@ pub fn changelog(index_url: &str) -> AppResult<Vec<ChangelogRelease>> {
         .map(|release| ChangelogRelease {
             version: release.tag_name.clone(),
             title: release.name.unwrap_or(release.tag_name),
-            body: release
-                .body
-                .unwrap_or_else(|| {
-                    if release.prerelease {
-                        "Prerelease published without release notes.".to_string()
-                    } else {
-                        "Release published without release notes.".to_string()
-                    }
-                }),
+            body: release.body.unwrap_or_else(|| {
+                if release.prerelease {
+                    "Prerelease published without release notes.".to_string()
+                } else {
+                    "Release published without release notes.".to_string()
+                }
+            }),
             published_at: release.published_at,
             url: release.html_url,
         })
@@ -173,13 +176,13 @@ pub fn changelog(index_url: &str) -> AppResult<Vec<ChangelogRelease>> {
 }
 
 pub fn download(release: AppRelease) -> AppResult<DownloadedUpdate> {
-    validate_url(&release.portable.url)?;
+    let release = normalize_release(release)?;
     let bytes = reqwest::blocking::get(&release.portable.url)?
         .error_for_status()?
         .bytes()?;
-    let cache = update_cache_dir()?.join(&release.version);
+    let cache = update_version_cache_dir(&release.version)?;
     fs::create_dir_all(&cache)?;
-    let archive_path = cache.join("kairos-patch-portable.zip");
+    let archive_path = cache.join(PORTABLE_ARCHIVE_NAME);
     fs::write(&archive_path, &bytes)?;
 
     let actual_sha = sha256_file(&archive_path)?;
@@ -198,42 +201,60 @@ pub fn download(release: AppRelease) -> AppResult<DownloadedUpdate> {
     })
 }
 
-pub fn prepare_portable_install(app: tauri::AppHandle, downloaded: DownloadedUpdate) -> AppResult<PortableInstallPlan> {
+pub fn prepare_portable_install(
+    app: tauri::AppHandle,
+    downloaded: DownloadedUpdate,
+) -> AppResult<PortableInstallPlan> {
     let exe_path = std::env::current_exe()?;
     let app_dir = exe_path
         .parent()
         .ok_or_else(|| AppError::Message("无法定位当前程序目录".to_string()))?
         .to_path_buf();
+    let version = update_version_component(&downloaded.version)?;
+    validate_sha256(&downloaded.sha256)?;
+    let cache = update_version_cache_dir(&version)?;
+    fs::create_dir_all(&cache)?;
     let archive_path = PathBuf::from(&downloaded.archive_path);
     if !archive_path.exists() {
         return msg("更新包不存在，请重新下载");
     }
+    let expected_archive = cache.join(PORTABLE_ARCHIVE_NAME);
+    if archive_path.canonicalize()? != expected_archive.canonicalize()? {
+        return msg("更新包路径不在当前版本缓存目录，请重新下载");
+    }
+    let actual_sha = sha256_file(&archive_path)?;
+    if !actual_sha.eq_ignore_ascii_case(&downloaded.sha256) {
+        return Err(AppError::Message(format!(
+            "portable zip SHA256 校验失败，期望 {}，实际 {}",
+            downloaded.sha256, actual_sha
+        )));
+    }
 
-    let staging_dir = update_cache_dir()?.join(&downloaded.version).join("staged");
+    let staging_dir = cache.join("staged");
     if staging_dir.exists() {
         fs::remove_dir_all(&staging_dir)?;
     }
     fs::create_dir_all(&staging_dir)?;
     extract_zip(&archive_path, &staging_dir)?;
 
-    let script_path = update_cache_dir()?
-        .join(&downloaded.version)
-        .join("apply-portable-update.ps1");
+    let script_path = cache.join("apply-portable-update.ps1");
     write_install_script(&script_path, &staging_dir, &app_dir, &exe_path)?;
 
-    Command::new("powershell")
+    let mut command = Command::new("powershell");
+    command
         .arg("-ExecutionPolicy")
         .arg("Bypass")
         .arg("-File")
         .arg(&script_path)
         .arg("-Pid")
-        .arg(std::process::id().to_string())
-        .spawn()?;
+        .arg(std::process::id().to_string());
+    hide_command_window(&mut command);
+    command.spawn()?;
 
     app.exit(0);
 
     Ok(PortableInstallPlan {
-        version: downloaded.version,
+        version,
         archive_path: downloaded.archive_path,
         staging_dir: staging_dir.display().to_string(),
         script_path: script_path.display().to_string(),
@@ -249,25 +270,137 @@ fn update_cache_dir() -> AppResult<PathBuf> {
     Ok(base)
 }
 
-fn validate_url(url: &str) -> AppResult<()> {
-    if url.starts_with("https://") {
+fn update_version_cache_dir(version: &str) -> AppResult<PathBuf> {
+    Ok(update_cache_dir()?.join(update_version_component(version)?))
+}
+
+fn validate_update_source_url(url: &str) -> AppResult<()> {
+    let parsed = parse_https_url(url)?;
+    if parsed.host_str() != Some(TRUSTED_GITHUB_HOST)
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return msg("更新源必须使用官方 GitHub Release 的 release-index.json");
+    }
+    let Some(segments) = parsed.path_segments() else {
+        return msg("更新源路径无效");
+    };
+    let segments = segments.collect::<Vec<_>>();
+    let is_latest = segments
+        == [
+            TRUSTED_GITHUB_OWNER,
+            TRUSTED_GITHUB_REPO,
+            "releases",
+            "latest",
+            "download",
+            RELEASE_INDEX_ASSET,
+        ];
+    let is_tagged = segments.len() == 6
+        && segments[0] == TRUSTED_GITHUB_OWNER
+        && segments[1] == TRUSTED_GITHUB_REPO
+        && segments[2] == "releases"
+        && segments[3] == "download"
+        && update_version_component(segments[4]).is_ok()
+        && segments[5] == RELEASE_INDEX_ASSET;
+    if is_latest || is_tagged {
         Ok(())
     } else {
-        msg("更新源必须使用 https:// URL")
+        msg("更新源必须使用官方 GitHub Release 的 release-index.json")
+    }
+}
+
+fn validate_portable_asset_url(url: &str, version: &str) -> AppResult<()> {
+    let parsed = parse_https_url(url)?;
+    if parsed.host_str() != Some(TRUSTED_GITHUB_HOST)
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return msg("更新包必须来自官方 GitHub Release asset");
+    }
+    let Some(segments) = parsed.path_segments() else {
+        return msg("更新包 URL 路径无效");
+    };
+    let segments = segments.collect::<Vec<_>>();
+    let expected_tag = format!("v{version}");
+    let expected_asset = format!("KairosPatch-v{version}-portable.zip");
+    if segments
+        == [
+            TRUSTED_GITHUB_OWNER,
+            TRUSTED_GITHUB_REPO,
+            "releases",
+            "download",
+            &expected_tag,
+            &expected_asset,
+        ]
+    {
+        Ok(())
+    } else {
+        msg("更新包必须来自匹配版本的官方 GitHub Release asset")
+    }
+}
+
+fn parse_https_url(url: &str) -> AppResult<reqwest::Url> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|_| AppError::Message("URL 格式无效".to_string()))?;
+    if parsed.scheme() != "https" {
+        return msg("更新 URL 必须使用 https://");
+    }
+    Ok(parsed)
+}
+
+fn normalize_release_index(index: ReleaseIndex) -> AppResult<Vec<AppRelease>> {
+    if index.app_id != UPDATE_APP_ID {
+        return msg("更新索引 app_id 不匹配");
+    }
+    index
+        .releases
+        .into_iter()
+        .map(normalize_release)
+        .collect::<AppResult<Vec<_>>>()
+}
+
+fn normalize_release(mut release: AppRelease) -> AppResult<AppRelease> {
+    let version = update_version_component(&release.version)?;
+    validate_portable_asset_url(&release.portable.url, &version)?;
+    validate_sha256(&release.portable.sha256)?;
+    release.version = version;
+    Ok(release)
+}
+
+fn update_version_component(version: &str) -> AppResult<String> {
+    let version = version.trim();
+    let normalized = version.strip_prefix('v').unwrap_or(version);
+    if normalized.is_empty()
+        || normalized.starts_with('v')
+        || version.contains('/')
+        || version.contains('\\')
+        || version.contains(':')
+        || version.contains("..")
+        || version
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return msg("更新版本号不是安全的路径组件");
+    }
+    Version::parse(normalized)
+        .map(|version| version.to_string())
+        .map_err(|_| AppError::Message("更新版本号必须是 SemVer".to_string()))
+}
+
+fn validate_sha256(value: &str) -> AppResult<()> {
+    if value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        msg("更新包 SHA256 格式无效")
     }
 }
 
 fn github_repo_from_update_source(url: &str) -> Option<(String, String)> {
-    let marker = "github.com/";
-    let after_host = url.split_once(marker)?.1;
-    let mut parts = after_host.split('/');
-    let owner = parts.next()?.to_string();
-    let repo = parts.next()?.to_string();
-    if owner.is_empty() || repo.is_empty() {
-        None
-    } else {
-        Some((owner, repo))
-    }
+    validate_update_source_url(url).ok()?;
+    Some((
+        TRUSTED_GITHUB_OWNER.to_string(),
+        TRUSTED_GITHUB_REPO.to_string(),
+    ))
 }
 
 fn is_newer(candidate: &str, current: &str) -> bool {
@@ -305,7 +438,12 @@ fn extract_zip(archive_path: &Path, target_dir: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn write_install_script(script_path: &Path, staging_dir: &Path, app_dir: &Path, exe_path: &Path) -> AppResult<()> {
+fn write_install_script(
+    script_path: &Path,
+    staging_dir: &Path,
+    app_dir: &Path,
+    exe_path: &Path,
+) -> AppResult<()> {
     if let Some(parent) = script_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -332,6 +470,100 @@ Start-Process -FilePath $exe -WorkingDirectory $appDir
     Ok(())
 }
 
+#[cfg(windows)]
+fn hide_command_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_command_window(_command: &mut Command) {}
+
 fn escape_ps(path: &Path) -> String {
     path.display().to_string().replace('"', "`\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_release() -> AppRelease {
+        AppRelease {
+            version: "0.1.2".to_string(),
+            notes: None,
+            published_at: None,
+            portable: PortableAsset {
+                url: "https://github.com/SevenThRe/karios-patch/releases/download/v0.1.2/KairosPatch-v0.1.2-portable.zip".to_string(),
+                sha256: "21c97f4211097137a951ece018f12753e932e1ded2c018296f68f0037c0c8db8".to_string(),
+                size: Some(3545512),
+            },
+        }
+    }
+
+    #[test]
+    fn accepts_only_official_update_index_urls() {
+        assert!(validate_update_source_url(DEFAULT_UPDATE_SOURCE).is_ok());
+        assert!(
+            validate_update_source_url(
+                "https://github.com/SevenThRe/karios-patch/releases/download/v0.1.2/release-index.json"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_update_source_url(
+                "https://github.com/attacker/karios-patch/releases/latest/download/release-index.json"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_update_source_url(
+                "https://example.com/SevenThRe/karios-patch/releases/latest/download/release-index.json"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validates_release_asset_matches_version_and_repo() {
+        assert!(normalize_release(valid_release()).is_ok());
+
+        let mut wrong_version = valid_release();
+        wrong_version.portable.url = "https://github.com/SevenThRe/karios-patch/releases/download/v0.1.3/KairosPatch-v0.1.3-portable.zip".to_string();
+        assert!(normalize_release(wrong_version).is_err());
+
+        let mut wrong_repo = valid_release();
+        wrong_repo.portable.url = "https://github.com/SevenThRe/other/releases/download/v0.1.2/KairosPatch-v0.1.2-portable.zip".to_string();
+        assert!(normalize_release(wrong_repo).is_err());
+    }
+
+    #[test]
+    fn validates_update_version_as_safe_semver_component() {
+        assert_eq!(update_version_component("0.1.2").unwrap(), "0.1.2");
+        assert_eq!(update_version_component("v0.1.2").unwrap(), "0.1.2");
+        assert!(update_version_component("vv0.1.2").is_err());
+        assert!(update_version_component("../0.1.2").is_err());
+        assert!(update_version_component("0.1.2\\evil").is_err());
+        assert!(update_version_component("latest").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_release_index_metadata() {
+        let index = ReleaseIndex {
+            app_id: "other-app".to_string(),
+            latest: "0.1.2".to_string(),
+            releases: vec![valid_release()],
+        };
+
+        assert!(normalize_release_index(index).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_sha256_metadata() {
+        let mut release = valid_release();
+        release.portable.sha256 = "not-a-sha".to_string();
+
+        assert!(normalize_release(release).is_err());
+    }
 }

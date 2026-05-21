@@ -1,32 +1,26 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  AlertTriangle,
   ArchiveRestore,
-  Box,
-  CalendarDays,
-  CheckCircle2,
-  ChevronRight,
-  CircleDot,
+  Bug,
+  Download,
   ExternalLink,
-  FileArchive,
-  FilePlus2,
-  FileWarning,
   Folder,
   FolderOpen,
   GitCompare,
   HardDrive,
+  History,
   MoreHorizontal,
+  Paperclip,
   RefreshCw,
   Rocket,
-  RotateCcw,
-  ShieldCheck,
-  Sparkles,
-  History,
-  Trash2,
+  Settings,
+  X,
 } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
+import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
+import { DiffEditor } from '@monaco-editor/react'
 import './App.css'
 
 type FileAction = {
@@ -45,6 +39,22 @@ type Conflict = {
   reason: string
 }
 
+type OperationLog = {
+  level: 'info' | 'warn' | 'error'
+  message: string
+}
+
+type OperationProgress = {
+  operation_id: string
+  stage: string
+  message: string
+  current: number
+  total: number
+  percent: number
+  path?: string | null
+  done: boolean
+}
+
 type UpdatePlan = {
   from: string
   to: string
@@ -58,11 +68,6 @@ type UpdatePlan = {
   conflicts: Conflict[]
   backup_candidates: string[]
   logs: OperationLog[]
-}
-
-type OperationLog = {
-  level: 'info' | 'warn' | 'error'
-  message: string
 }
 
 type ManifestFile = {
@@ -79,35 +84,22 @@ type PackManifest = {
   pack_id: string
   pack_name: string
   version: string
-  mc_version?: string
-  loader?: {
-    type: string
-    version: string
-  }
   created_at: string
   files: ManifestFile[]
-}
-
-type ManifestDiff = {
-  from: string
-  to: string
-  added: ManifestFile[]
-  removed: ManifestFile[]
-  updated: Array<{
-    old: ManifestFile
-    new: ManifestFile
-  }>
-  renamed: Array<{
-    old: ManifestFile
-    new: ManifestFile
-  }>
-  unchanged: ManifestFile[]
 }
 
 type CompareResult = {
   old_manifest: PackManifest
   new_manifest: PackManifest
-  diff: ManifestDiff
+  diff: {
+    from: string
+    to: string
+    added: ManifestFile[]
+    removed: ManifestFile[]
+    updated: Array<{ old: ManifestFile; new: ManifestFile }>
+    renamed: Array<{ old: ManifestFile; new: ManifestFile }>
+    unchanged: ManifestFile[]
+  }
 }
 
 type BackupSummary = {
@@ -124,8 +116,18 @@ type ApplyResult = {
   logs: OperationLog[]
 }
 
-type UpdateSourceConfig = {
-  index_url: string
+type ConservativeApplyResult = {
+  backup_id?: string | null
+  target_version: string
+  applied_changes: Array<{
+    path: string
+    action: string
+    source_path?: string | null
+  }>
+  preserved_paths: string[]
+  protected_paths: string[]
+  state_path: string
+  logs: string[]
 }
 
 type AppPreferences = {
@@ -133,6 +135,10 @@ type AppPreferences = {
   old_source?: string | null
   new_source?: string | null
   locale?: Locale | null
+}
+
+type UpdateSourceConfig = {
+  index_url: string
 }
 
 type PortableAsset = {
@@ -170,248 +176,284 @@ type ChangelogRelease = {
   url: string
 }
 
-type ActivePage = 'dashboard' | 'diff' | 'plan' | 'backups' | 'instance' | 'updates' | 'changelog'
+type SourceDiffPreview = {
+  path: string
+  old_text: string
+  new_text: string
+  language: string
+  notice?: string | null
+}
+
+type ConservativeAction = {
+  path: string
+  action: string
+  reason: string
+  mod_name?: string | null
+  from_version?: string | null
+  to_version?: string | null
+}
+
+type ReviewItem = {
+  id: string
+  path: string
+  kind: string
+  reason: string
+  default_choice: string
+  choices: string[]
+  mod_name?: string | null
+  mod_id?: string | null
+  local_version?: string | null
+  target_version?: string | null
+}
+
+type ProtectedItem = {
+  path: string
+  reason: string
+}
+
+type ConservativeUpdatePlan = {
+  mode: string
+  target_version: string
+  auto_actions: ConservativeAction[]
+  review_items: ReviewItem[]
+  protected_items: ProtectedItem[]
+  logs: string[]
+}
+
+type FeedbackPackage = {
+  report_path: string
+  archive_path: string
+  issue_body_path: string
+  app_log_path: string
+  issue_url: string
+}
+
+type FeedbackIssueType = 'Bug' | '建议' | '安装失败' | '更新失败' | '其他'
+
+type FeedbackFormState = {
+  issueType: FeedbackIssueType
+  title: string
+  description: string
+  reproductionSteps: string
+  includeLogs: boolean
+  includeConfig: boolean
+  attachmentPaths: string[]
+  contact: string
+}
+
+type DiffTone = 'added' | 'updated' | 'removed' | 'protected' | 'conflict'
+
+type DiffFileCandidate = {
+  path: string
+  label: string
+  tone: DiffTone
+}
+
+type ActivePage = 'update' | 'backups' | 'settings'
 type Locale = 'zh' | 'en'
 type PreferencePathKey = 'instance_dir' | 'old_source' | 'new_source'
 
 const PREFERENCES_STORAGE_KEY = 'kairos-patch:preferences'
+const feedbackIssueTypes: FeedbackIssueType[] = ['Bug', '建议', '安装失败', '更新失败', '其他']
+const defaultFeedbackForm: FeedbackFormState = {
+  issueType: 'Bug',
+  title: '',
+  description: '',
+  reproductionSteps: '',
+  includeLogs: true,
+  includeConfig: false,
+  attachmentPaths: [],
+  contact: '',
+}
 
-const i18n = {
+const copy = {
   zh: {
-    dashboard: '仪表盘',
-    diff: '差异比较',
-    plan: '更新计划',
+    update: '更新',
     backups: '备份',
-    instance: '实例',
-    appUpdate: '应用更新',
-    changelog: '更新日志',
-    packState: 'Minecraft 整合包状态管理',
-    dashboardTitle: 'Kairos Patch 仪表盘',
-    updateTitle: '应用更新',
-    changelogTitle: '更新日志',
-    diffTitle: '差异比较',
-    planTitle: '更新计划',
-    backupsTitle: '备份',
-    instanceTitle: '实例',
-    ready: '就绪',
-    working: '处理中',
-    selectedPack: '当前整合包',
-    noPlan: '尚未生成计划',
-    planned: '已生成',
-    idle: '空闲',
-    instanceDir: '用户实例目录',
-    oldPack: '旧官方包',
-    newPack: '新官方包',
-    inUse: '使用中',
-    baseline: '基准',
-    target: '目标',
+    settings: '设置',
+    title: 'Kairos Patch',
+    subtitle: 'Minecraft 整合包更新工具',
+    instance: '当前实例',
+    oldPack: '当前基线',
+    oldPackAdvanced: '高级：当前基线包（可选）',
+    newPack: '目标版本',
     selectInstance: '选择 Minecraft 实例目录',
     selectOld: '选择旧官方包目录或 ZIP',
     selectNew: '选择新官方包目录或 ZIP',
-    waitingScan: '等待扫描',
-    notScanned: '未扫描',
-    required: '必需',
-    selected: '目录已选择',
-    compare: '比较',
-    compareSources: '比较源包',
-    createBackup: '创建备份',
-    openPackdelta: '打开 .packdelta',
-    refreshScan: '刷新扫描',
-    generatePlan: '生成更新计划',
-    executePlan: '执行更新计划',
-    backupFirst: '先备份，再安全更新整合包',
-    pendingChanges: '待处理变更',
-    addedFiles: '新增文件',
-    updatedFiles: '更新文件',
-    mergedConfigs: '合并配置',
-    removedFiles: '删除文件',
-    conflicts: '冲突',
-    diffPreview: '差异预览',
-    updatePlan: '更新计划',
-    conflictProtection: '冲突保护',
-    latestBackup: '最近备份',
-    instanceInfo: '实例信息',
-    noComparison: '尚未加载比较结果',
-    noComparisonHint: '选择实例、旧官方包和新官方包后运行比较。',
-    runCompareHint: '运行比较以加载真实文件变更',
-    estimated: '预计 2-5 分钟',
-    checkConflicts: '运行比较以检查冲突',
-    noBackup: '尚未创建备份',
-    check: '检查',
-    restore: '还原',
-    save: '保存',
-    notes: '日志',
-    download: '下载',
-    apply: '应用',
-    appVersion: '应用版本',
-    latestChecked: '最近检查',
-    downloaded: '已下载',
+    dropPath: '拖拽到这里',
+    dropPathUnsupported: '没有读取到拖拽路径，请使用选择按钮。',
+    operationActive: '正在更新',
+    operationDone: '更新完成',
+    operationFailed: '更新失败',
+    chooseFolder: '选择目录',
+    chooseZip: '选择 ZIP',
+    compare: '检查更新',
+    apply: '开始更新',
+    refresh: '刷新备份',
+    openState: '打开 .packdelta',
+    safe: '可安全更新',
+    blocked: '需要确认冲突',
+    waiting: '等待检查',
+    missing: '路径未完整',
+    working: '处理中',
+    planTitle: '检测到更新',
+    noPlan: '未检查',
+    emptyPlanBody: '等待实例和目标版本。',
+    safeBody: '更新项已准备。',
+    conflictBody: '待确认项已列出。',
+    autoActions: '可自动处理',
+    reviewItems: '需要你确认',
+    protectedItems: '始终保护',
+    conservativeMode: '保守模式',
+    changedFiles: '文件变化',
+    protectedFiles: '将保留用户文件',
+    conflicts: '需要确认',
+    updated: '更新',
+    added: '新增',
+    removed: '移除',
+    protected: '保护',
+    viewDiff: '查看差异',
+    diff: '差异',
+    fullDiff: '完整文件差异',
+    noDiff: '选择文件后显示内置 diff。',
+    diffUnavailable: '这个文件暂时不能用文本方式预览。',
+    recentBackups: '备份记录',
+    noBackups: '还没有备份记录。',
+    rollback: '还原',
+    appUpdate: '应用更新',
+    feedback: '反馈 Bug',
+    createFeedback: '生成反馈包',
+    feedbackBody: '填写反馈表单，生成本地诊断包，并打开 GitHub Issue 模板。',
+    issueType: '问题类型',
+    feedbackTitle: '标题',
+    feedbackDescription: '描述',
+    reproductionSteps: '复现步骤',
+    includeLogs: '上传日志',
+    includeConfig: '上传配置',
+    attachments: '截图/附件',
+    chooseAttachments: '选择附件',
+    clearAttachments: '清空附件',
+    contact: '联系方式（可选）',
+    feedbackTitlePlaceholder: '例如：更新到 0.1.2 后启动失败',
+    feedbackDescriptionPlaceholder: '说明你看到的现象、期望结果和实际结果。',
+    reproductionStepsPlaceholder: '1. 打开工具\n2. 选择实例和目标包\n3. 点击开始更新',
+    contactPlaceholder: '邮箱、GitHub ID 或其他联系方式',
+    issueBody: 'Issue 内容',
+    diagnosticPackage: '诊断包',
+    appLogPath: '日志文件',
     updateSource: '更新源',
-    notChecked: '未检查',
-    none: '无',
-    notConfigured: '未配置',
+    save: '保存',
+    check: '检查',
+    download: '下载',
+    install: '应用',
+    changelog: '更新日志',
     loadNotes: '加载日志',
-    noChangelog: '尚未加载更新日志',
-    noChangelogHint: '从更新源配置的 GitHub 仓库加载发布说明。',
-    sourceSelection: '源包选择',
-    oldVsNew: '旧包 / 新包',
-    diffResult: '差异结果',
-    waitingCompare: '等待比较',
-    protectedPlan: '受保护更新计划',
-    notGenerated: '未生成',
-    planDetails: '计划明细',
-    backupRecords: '备份记录',
-    instanceRequired: '需要实例目录',
-    availableBackups: '可用备份',
-    rollbackHint: '还原已备份的文件',
-    instanceScan: '实例扫描',
-    instanceManifest: '实例清单',
-    waiting: '等待',
-    waitingInstance: '等待实例',
-    readyBackupList: '可读取备份',
-    scanInstance: '扫描实例',
-    buildManifest: '生成本地清单',
-    readBackups: '读取 .packdelta 备份清单',
-    scanBothPacks: '扫描两个官方包并计算文件差异',
-    buildPlanActions: '生成受保护的更新动作',
-    backupThenWrite: '先备份，再写入变更',
-    portableUpdate: '便携版应用更新',
-    currentVersion: '当前版本',
-    releaseSource: '发布源',
-    githubReleases: 'GitHub 发布',
-    updateSourceHint: '便携更新使用已配置的 GitHub release-index.json。',
-    verified: '已校验',
-    available: '可用',
-    sourceDiffEmpty: '尚未加载源包差异',
-    sourceDiffHint: '选择旧官方包和新官方包目录后比较源包。',
-    noFilesGroup: '此分组没有文件',
-    moreFiles: '更多文件',
-    protectedUserFiles: '保留的用户文件',
-    renamedFiles: '重命名文件',
-    lastBackup: '最近备份',
-    packName: '整合包名称',
-    packId: '整合包 ID',
+    language: '语言',
+    lastLog: '最近日志',
+    latest: '最新',
+    notChecked: '未检查',
+    notSelected: '未选择',
+    notScanned: '未扫描',
     version: '版本',
-    files: '文件数',
-    fileSummaryHint: '扫描实例后查看文件归属和处理策略。',
+    files: '文件',
+    keepChoice: '保留',
+    removeChoice: '移除',
+    replaceChoice: '采用目标',
+    saveTargetChoice: '另存目标',
   },
   en: {
-    dashboard: 'Dashboard',
-    diff: 'Diff Compare',
-    plan: 'Update Plan',
+    update: 'Update',
     backups: 'Backups',
-    instance: 'Instance',
-    appUpdate: 'App Update',
-    changelog: 'Changelog',
-    packState: 'Minecraft Pack State Manager',
-    dashboardTitle: 'Kairos Patch Dashboard',
-    updateTitle: 'App Update',
-    changelogTitle: 'Changelog',
-    diffTitle: 'Diff Compare',
-    planTitle: 'Update Plan',
-    backupsTitle: 'Backups',
-    instanceTitle: 'Instance',
-    ready: 'Ready',
-    working: 'Working',
-    selectedPack: 'Selected Pack',
-    noPlan: 'No plan generated',
-    planned: 'Planned',
-    idle: 'Idle',
-    instanceDir: 'User Instance Directory',
-    oldPack: 'Old Official Pack',
-    newPack: 'New Official Pack',
-    inUse: 'In use',
-    baseline: 'Baseline',
-    target: 'Target',
+    settings: 'Settings',
+    title: 'Kairos Patch',
+    subtitle: 'Minecraft modpack update workbench',
+    instance: 'Current instance',
+    oldPack: 'Current baseline',
+    oldPackAdvanced: 'Advanced: current baseline pack (optional)',
+    newPack: 'Target version',
     selectInstance: 'Select a Minecraft instance directory',
-    selectOld: 'Select the previous official pack folder or ZIP',
-    selectNew: 'Select the target official pack folder or ZIP',
-    waitingScan: 'Waiting for scan',
-    notScanned: 'Not scanned',
-    required: 'Required',
-    selected: 'Directory selected',
-    compare: 'Compare',
-    compareSources: 'Compare Sources',
-    createBackup: 'Create Backup',
-    openPackdelta: 'Open .packdelta',
-    refreshScan: 'Refresh Scan',
-    generatePlan: 'Generate update plan',
-    executePlan: 'Execute Update Plan',
-    backupFirst: 'Back up first, then safely update the pack',
-    pendingChanges: 'Pending Changes',
-    addedFiles: 'Added Files',
-    updatedFiles: 'Updated Files',
-    mergedConfigs: 'Merged Configs',
-    removedFiles: 'Removed Files',
-    conflicts: 'Conflicts',
-    diffPreview: 'Diff Preview',
-    updatePlan: 'Update Plan',
-    conflictProtection: 'Conflict Protection',
-    latestBackup: 'Latest Backup',
-    instanceInfo: 'Instance Info',
-    noComparison: 'No comparison loaded',
-    noComparisonHint: 'Select the instance, old official pack, and new official pack, then run Compare.',
-    runCompareHint: 'Run Compare to load real file changes',
-    estimated: 'Estimated 2-5 min',
-    checkConflicts: 'Run Compare to check conflicts',
-    noBackup: 'No backup created yet',
-    check: 'Check',
-    restore: 'Restore',
+    selectOld: 'Select previous official pack folder or ZIP',
+    selectNew: 'Select target official pack folder or ZIP',
+    dropPath: 'Drop here',
+    dropPathUnsupported: 'No dropped path was available. Use the picker button instead.',
+    operationActive: 'Updating',
+    operationDone: 'Update complete',
+    operationFailed: 'Update failed',
+    chooseFolder: 'Choose folder',
+    chooseZip: 'Choose ZIP',
+    compare: 'Check update',
+    apply: 'Start update',
+    refresh: 'Refresh backups',
+    openState: 'Open .packdelta',
+    safe: 'Safe to update',
+    blocked: 'Needs review',
+    waiting: 'Waiting for check',
+    missing: 'Paths needed',
+    working: 'Working',
+    planTitle: 'Update detected',
+    noPlan: 'Not checked',
+    emptyPlanBody: 'Waiting for instance and target version.',
+    safeBody: 'Update items ready.',
+    conflictBody: 'Review items listed.',
+    autoActions: 'Automatic',
+    reviewItems: 'Needs confirmation',
+    protectedItems: 'Always protected',
+    conservativeMode: 'Conservative mode',
+    changedFiles: 'File changes',
+    protectedFiles: 'User files kept',
+    conflicts: 'Needs review',
+    updated: 'Updated',
+    added: 'Added',
+    removed: 'Removed',
+    protected: 'Protected',
+    viewDiff: 'View diff',
+    diff: 'Diff',
+    fullDiff: 'Full file diff',
+    noDiff: 'Select a file to show the built-in diff.',
+    diffUnavailable: 'This file cannot be previewed as text yet.',
+    recentBackups: 'Backups',
+    noBackups: 'No backup records yet.',
+    rollback: 'Restore',
+    appUpdate: 'App Update',
+    feedback: 'Bug Feedback',
+    createFeedback: 'Create feedback package',
+    feedbackBody: 'Fill out the feedback form, create a local diagnostic package, and open the GitHub Issue template.',
+    issueType: 'Issue type',
+    feedbackTitle: 'Title',
+    feedbackDescription: 'Description',
+    reproductionSteps: 'Reproduction steps',
+    includeLogs: 'Upload logs',
+    includeConfig: 'Upload config',
+    attachments: 'Screenshots / attachments',
+    chooseAttachments: 'Choose attachments',
+    clearAttachments: 'Clear attachments',
+    contact: 'Contact (optional)',
+    feedbackTitlePlaceholder: 'Example: update to 0.1.2 fails to launch',
+    feedbackDescriptionPlaceholder: 'Describe what happened, what you expected, and what actually happened.',
+    reproductionStepsPlaceholder: '1. Open the tool\n2. Select the instance and target pack\n3. Start update',
+    contactPlaceholder: 'Email, GitHub ID, or another contact method',
+    issueBody: 'Issue body',
+    diagnosticPackage: 'Diagnostic package',
+    appLogPath: 'Log file',
+    updateSource: 'Update source',
     save: 'Save',
-    notes: 'Notes',
+    check: 'Check',
     download: 'Download',
-    apply: 'Apply',
-    appVersion: 'App Version',
-    latestChecked: 'Latest Checked',
-    downloaded: 'Downloaded',
-    updateSource: 'Update Source',
+    install: 'Apply',
+    changelog: 'Changelog',
+    loadNotes: 'Load notes',
+    language: 'Language',
+    lastLog: 'Latest log',
+    latest: 'Latest',
     notChecked: 'Not checked',
-    none: 'None',
-    notConfigured: 'Not configured',
-    loadNotes: 'Load Notes',
-    noChangelog: 'No changelog loaded',
-    noChangelogHint: 'Load release notes from the GitHub repository configured in the update source.',
-    sourceSelection: 'Source Selection',
-    oldVsNew: 'Old vs New',
-    diffResult: 'Diff Result',
-    waitingCompare: 'Waiting for compare',
-    protectedPlan: 'Protected Update Plan',
-    notGenerated: 'Not generated',
-    planDetails: 'Plan Details',
-    backupRecords: 'Backup Records',
-    instanceRequired: 'Instance required',
-    availableBackups: 'Available Backups',
-    rollbackHint: 'Rollback restores captured files',
-    instanceScan: 'Instance Scan',
-    instanceManifest: 'Instance Manifest',
-    waiting: 'Waiting',
-    waitingInstance: 'Waiting for instance',
-    readyBackupList: 'Ready to list backups',
-    scanInstance: 'Scan Instance',
-    buildManifest: 'Build a local manifest',
-    readBackups: 'Read .packdelta backup manifests',
-    scanBothPacks: 'Scan both official packs and calculate file diff',
-    buildPlanActions: 'Build protected update actions',
-    backupThenWrite: 'Backup first, then write changes',
-    portableUpdate: 'Portable App Update',
-    currentVersion: 'Current',
-    releaseSource: 'Release Source',
-    githubReleases: 'GitHub Releases',
-    updateSourceHint: 'Portable updates use the configured GitHub release-index.json.',
-    verified: 'Verified',
-    available: 'Available',
-    sourceDiffEmpty: 'No source diff loaded',
-    sourceDiffHint: 'Select the old and new official pack folders, then compare sources.',
-    noFilesGroup: 'No files in this group',
-    moreFiles: 'more files',
-    protectedUserFiles: 'Protected User Files',
-    renamedFiles: 'Renamed',
-    lastBackup: 'Last Backup',
-    packName: 'Pack Name',
-    packId: 'Pack ID',
+    notSelected: 'Not selected',
+    notScanned: 'Not scanned',
     version: 'Version',
     files: 'Files',
-    fileSummaryHint: 'Scan the instance to inspect file ownership and strategies.',
+    keepChoice: 'Keep',
+    removeChoice: 'Remove',
+    replaceChoice: 'Use target',
+    saveTargetChoice: 'Save target',
   },
 } satisfies Record<Locale, Record<string, string>>
 
@@ -432,64 +474,98 @@ function cachePreferences(preferences: AppPreferences) {
   try {
     window.localStorage.setItem(PREFERENCES_STORAGE_KEY, JSON.stringify(preferences))
   } catch {
-    // OS-level preference storage is the source of truth in the desktop app.
+    // Desktop settings are the source of truth when localStorage is unavailable.
   }
 }
 
-function restoredPreferenceCount(preferences: AppPreferences | null) {
-  return [preferences?.instance_dir, preferences?.old_source, preferences?.new_source]
-    .filter(Boolean)
-    .length
-}
-
-function preferenceRestoreMessage(preferences: AppPreferences | null) {
-  const count = restoredPreferenceCount(preferences)
-  if (!count) {
-    return '请选择实例目录、基准包和目标包，然后比较生成受保护的更新计划。'
-  }
-  return isLocale(preferences?.locale) && preferences.locale === 'en'
-    ? `Restored ${count} previously selected directories.`
-    : `已恢复上次选择的 ${count} 个目录。`
+function displayName(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path
 }
 
 function App() {
   const initialPreferences = useMemo(() => readCachedPreferences(), [])
-  const [activePage, setActivePage] = useState<ActivePage>('dashboard')
+  const [activePage, setActivePage] = useState<ActivePage>('update')
   const [locale, setLocale] = useState<Locale>(isLocale(initialPreferences?.locale) ? initialPreferences.locale : 'zh')
   const [instanceDir, setInstanceDir] = useState(initialPreferences?.instance_dir ?? '')
   const [oldSource, setOldSource] = useState(initialPreferences?.old_source ?? '')
   const [newSource, setNewSource] = useState(initialPreferences?.new_source ?? '')
   const [plan, setPlan] = useState<UpdatePlan | null>(null)
+  const [conservativePlan, setConservativePlan] = useState<ConservativeUpdatePlan | null>(null)
+  const [compareResult, setCompareResult] = useState<CompareResult | null>(null)
   const [backups, setBackups] = useState<BackupSummary[]>([])
   const [busy, setBusy] = useState('')
-  const [message, setMessage] = useState(() => preferenceRestoreMessage(initialPreferences))
-  const [lastApply, setLastApply] = useState<ApplyResult | null>(null)
-  const [compareResult, setCompareResult] = useState<CompareResult | null>(null)
-  const [instanceManifest, setInstanceManifest] = useState<PackManifest | null>(null)
+  const [message, setMessage] = useState('')
+  const [lastLogs, setLastLogs] = useState<OperationLog[]>([])
+  const [selectedDiffFile, setSelectedDiffFile] = useState<DiffFileCandidate | null>(null)
+  const [diffPreview, setDiffPreview] = useState<SourceDiffPreview | null>(null)
+  const [reviewChoices, setReviewChoices] = useState<Record<string, string>>({})
   const [updateSource, setUpdateSource] = useState('')
   const [appUpdate, setAppUpdate] = useState<AppUpdateCheck | null>(null)
   const [downloadedUpdate, setDownloadedUpdate] = useState<DownloadedUpdate | null>(null)
   const [changelog, setChangelog] = useState<ChangelogRelease[]>([])
+  const [feedbackPackage, setFeedbackPackage] = useState<FeedbackPackage | null>(null)
+  const [feedbackForm, setFeedbackForm] = useState<FeedbackFormState>(defaultFeedbackForm)
+  const [operationProgress, setOperationProgress] = useState<OperationProgress | null>(null)
   const [appVersion, setAppVersion] = useState('0.1.0')
-  const copy = i18n[locale]
+  const operationSequence = useRef(0)
+  const t = copy[locale]
 
-  const canPreview = Boolean(instanceDir && oldSource && newSource && !busy)
+  const hasBaseline = Boolean(oldSource)
+  const canCheck = Boolean(instanceDir && newSource && !busy)
+  const baselineHasWork = Boolean(plan && (plan.added.length || plan.updated.length || plan.removed.length || plan.merged.length || plan.renamed.length))
+  const conservativeHasWork = Boolean(conservativePlan && (
+    conservativePlan.auto_actions.length ||
+    conservativePlan.review_items.some((item) => (reviewChoices[item.id] ?? item.default_choice) !== item.default_choice)
+  ))
+  const canApply = Boolean(canCheck && (
+    (hasBaseline && plan && !plan.conflicts.length && baselineHasWork) ||
+    (!hasBaseline && conservativePlan && conservativeHasWork)
+  ))
+  const currentPatchVersion = conservativePlan?.target_version ?? plan?.to ?? appUpdate?.latest_version ?? appVersion
 
-  const totals = useMemo(() => {
-    const p = plan
-    return {
-      changed: p ? p.added.length + p.removed.length + p.updated.length + p.merged.length + p.renamed.length : 0,
-      added: p?.added.length ?? 0,
-      updated: p ? p.updated.length + p.merged.length + p.renamed.length : 0,
-      removed: p?.removed.length ?? 0,
-      protected: p?.preserved.length ?? 0,
-      current: p?.already_current.length ?? 0,
-      conflicts: p?.conflicts.length ?? 0,
-      backups: p?.backup_candidates.length ?? 0,
+  const status = useMemo(() => {
+    if (busy) return { label: t.working, tone: 'working' }
+    if (!instanceDir || !newSource) return { label: t.missing, tone: 'muted' }
+    if (conservativePlan?.review_items.length) return { label: t.blocked, tone: 'blocked' }
+    if (plan?.conflicts.length) return { label: t.blocked, tone: 'blocked' }
+    if (plan || conservativePlan) return { label: conservativePlan ? t.conservativeMode : t.safe, tone: 'safe' }
+    return { label: t.waiting, tone: 'muted' }
+  }, [busy, conservativePlan, instanceDir, newSource, plan, t])
+
+  const diffFiles = useMemo<DiffFileCandidate[]>(() => {
+    const candidates: DiffFileCandidate[] = []
+    if (compareResult) {
+      candidates.push(...compareResult.diff.updated.map((item) => ({ path: item.new.path, label: t.updated, tone: 'updated' as const })))
+      candidates.push(...compareResult.diff.added.map((item) => ({ path: item.path, label: t.added, tone: 'added' as const })))
+      candidates.push(...compareResult.diff.removed.map((item) => ({ path: item.path, label: t.removed, tone: 'removed' as const })))
+      candidates.push(...compareResult.diff.renamed.map((item) => ({ path: item.new.path, label: `${item.old.path} -> ${item.new.path}`, tone: 'updated' as const })))
     }
-  }, [plan])
+    if (plan) {
+      candidates.push(...plan.merged.map((item) => ({ path: item.path, label: t.updated, tone: 'updated' as const })))
+      candidates.push(...plan.conflicts.map((item) => ({ path: item.path, label: item.reason, tone: 'conflict' as const })))
+      candidates.push(...plan.preserved.map((path) => ({ path, label: t.protected, tone: 'protected' as const })))
+    }
+    if (conservativePlan) {
+      candidates.push(...conservativePlan.auto_actions.map((item) => ({ path: item.path, label: item.reason, tone: 'updated' as const })))
+      candidates.push(...conservativePlan.review_items.map((item) => ({ path: item.path, label: item.reason, tone: 'conflict' as const })))
+      candidates.push(...conservativePlan.protected_items.map((item) => ({ path: item.path, label: item.reason, tone: 'protected' as const })))
+    }
+    const seen = new Set<string>()
+    return candidates.filter((item) => {
+      const key = `${item.tone}:${item.path}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+  }, [compareResult, conservativePlan, plan, t])
 
-  const canExecutePlan = Boolean(plan && (totals.changed > 0 || totals.conflicts > 0) && canPreview)
+  const reviewCount = conservativePlan?.review_items.length ?? plan?.conflicts.length ?? 0
+  const protectedCount = conservativePlan?.protected_items.length ?? plan?.preserved.length ?? 0
+  const automaticCount = conservativePlan?.auto_actions.length ?? (
+    plan ? plan.added.length + plan.updated.length + plan.merged.length + plan.renamed.length + plan.removed.length : 0
+  )
+  const versionLabel = plan ? `${plan.from} -> ${plan.to}` : (conservativePlan ? conservativePlan.target_version : t.waiting)
+  const selectedDiffTitle = selectedDiffFile?.path ?? (diffFiles.length ? t.changedFiles : t.noDiff)
 
   function buildPreferences(overrides: Partial<AppPreferences> = {}): AppPreferences {
     return {
@@ -504,11 +580,7 @@ function App() {
   function persistPreferences(overrides: Partial<AppPreferences> = {}) {
     const preferences = buildPreferences(overrides)
     cachePreferences(preferences)
-    invoke<AppPreferences>('save_app_preferences', { preferences })
-      .then(cachePreferences)
-      .catch(() => {
-        // Selection still remains active in the current session.
-      })
+    invoke<AppPreferences>('save_app_preferences', { preferences }).then(cachePreferences).catch(() => undefined)
   }
 
   function changeLocale(nextLocale: Locale) {
@@ -516,264 +588,221 @@ function App() {
     persistPreferences({ locale: nextLocale })
   }
 
-  useEffect(() => {
-    getVersion()
-      .then(setAppVersion)
-      .catch(() => {
-        // Browser-only previews cannot read Tauri metadata.
-      })
+  function recordAppLog(level: OperationLog['level'], message: string, context?: string) {
+    invoke('append_app_log', {
+      request: {
+        level,
+        message,
+        context: context ?? null,
+      },
+    }).catch(() => undefined)
+  }
 
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => undefined)
     invoke<UpdateSourceConfig | null>('load_update_source')
       .then((config) => {
-        if (config?.index_url) {
-          setUpdateSource(config.index_url)
-        }
+        if (config?.index_url) setUpdateSource(config.index_url)
       })
-      .catch(() => {
-        // Loading update settings is optional; manual input remains available.
-      })
-
+      .catch(() => undefined)
     invoke<AppPreferences>('load_app_preferences')
       .then((preferences) => {
         cachePreferences(preferences)
-        if (isLocale(preferences.locale)) {
-          setLocale(preferences.locale)
-        }
-        if (preferences.instance_dir) {
-          setInstanceDir(preferences.instance_dir)
-        }
-        if (preferences.old_source) {
-          setOldSource(preferences.old_source)
-        }
-        if (preferences.new_source) {
-          setNewSource(preferences.new_source)
-        }
-        if (restoredPreferenceCount(preferences) > 0) {
-          setMessage(preferenceRestoreMessage(preferences))
-        }
+        if (isLocale(preferences.locale)) setLocale(preferences.locale)
+        if (preferences.instance_dir) setInstanceDir(preferences.instance_dir)
+        if (preferences.old_source) setOldSource(preferences.old_source)
+        if (preferences.new_source) setNewSource(preferences.new_source)
       })
-      .catch(() => {
-        // Browser-only previews keep using localStorage preferences.
-      })
+      .catch(() => undefined)
   }, [])
 
-  const pageCopy = {
-    dashboard: {
-      eyebrow: copy.packState,
-      title: copy.dashboardTitle,
-      body: message,
-    },
-    updates: {
-      eyebrow: locale === 'zh' ? '应用分发' : 'Application Delivery',
-      title: copy.updateTitle,
-      body: message,
-    },
-    diff: {
-      eyebrow: locale === 'zh' ? '整合包比较' : 'Pack Comparison',
-      title: copy.diffTitle,
-      body: compareResult
-        ? locale === 'zh'
-          ? `已比较 ${compareResult.old_manifest.files.length} 个基准文件和 ${compareResult.new_manifest.files.length} 个目标文件。`
-          : `Compared ${compareResult.old_manifest.files.length} baseline files with ${compareResult.new_manifest.files.length} target files.`
-        : locale === 'zh'
-          ? '选择旧官方包和新官方包目录，然后比较源包。'
-          : 'Select the old and new official pack folders, then run Compare Sources.',
-    },
-    plan: {
-      eyebrow: locale === 'zh' ? '受保护更新' : 'Protected Update',
-      title: copy.planTitle,
-      body: plan
-        ? locale === 'zh'
-          ? `计划 ${plan.from} -> ${plan.to}: ${totals.changed} 个变更文件，${totals.conflicts} 个冲突。`
-          : `Plan ${plan.from} -> ${plan.to}: ${totals.changed} changed files, ${totals.conflicts} conflicts.`
-        : locale === 'zh'
-          ? '选择三个目录后生成受保护的更新计划。'
-          : 'Select all three folders, then generate the protected update plan.',
-    },
-    backups: {
-      eyebrow: locale === 'zh' ? '恢复' : 'Recovery',
-      title: copy.backupsTitle,
-      body: backups.length
-        ? locale === 'zh' ? `找到 ${backups.length} 条备份记录。` : `Found ${backups.length} backup records for this instance.`
-        : locale === 'zh' ? '选择实例目录以读取备份记录。' : 'Select an instance directory to list backup records.',
-    },
-    instance: {
-      eyebrow: locale === 'zh' ? '本地状态' : 'Local State',
-      title: copy.instanceTitle,
-      body: instanceManifest
-        ? locale === 'zh' ? `已从 ${instanceManifest.pack_name} 扫描 ${instanceManifest.files.length} 个文件。` : `Scanned ${instanceManifest.files.length} files from ${instanceManifest.pack_name}.`
-        : locale === 'zh' ? '选择并扫描 Minecraft 实例目录。' : 'Select and scan a Minecraft instance directory.',
-    },
-    changelog: {
-      eyebrow: locale === 'zh' ? '发布历史' : 'Release History',
-      title: copy.changelogTitle,
-      body: changelog.length
-        ? locale === 'zh' ? `已加载 ${changelog.length} 条 GitHub 发布日志。` : `Loaded ${changelog.length} GitHub release notes.`
-        : message,
-    },
-  }[activePage]
+  useEffect(() => {
+    let mounted = true
+    let dispose: (() => void) | undefined
+    listen<OperationProgress>('operation-progress', (event) => {
+      if (mounted) setOperationProgress(event.payload)
+    })
+      .then((unlisten) => {
+        dispose = unlisten
+      })
+      .catch(() => undefined)
+    return () => {
+      mounted = false
+      dispose?.()
+    }
+  }, [])
 
   async function pickDirectory(key: PreferencePathKey, setter: (path: string) => void) {
     const selected = await open({ directory: true, multiple: false })
     if (typeof selected === 'string') {
       setter(selected)
       persistPreferences({ [key]: selected })
-      setPlan(null)
-      setLastApply(null)
-      setCompareResult(null)
-      setInstanceManifest(null)
     }
   }
 
-  async function pickZipSource(key: PreferencePathKey, setter: (path: string) => void) {
+  async function pickZipSource(key: Extract<PreferencePathKey, 'old_source' | 'new_source'>, setter: (path: string) => void) {
     const selected = await open({
       directory: false,
       multiple: false,
-      filters: [{ name: 'Minecraft pack zip', extensions: ['zip'] }],
+      filters: [{ name: 'ZIP', extensions: ['zip'] }],
     })
     if (typeof selected === 'string') {
       setter(selected)
       persistPreferences({ [key]: selected })
-      setPlan(null)
-      setLastApply(null)
-      setCompareResult(null)
-      setInstanceManifest(null)
     }
   }
 
-  async function runCompareSources() {
-    if (!oldSource || !newSource) return
-    setBusy('source-compare')
-    setMessage(locale === 'zh' ? '正在比较官方包源...' : 'Comparing official pack sources...')
-    try {
-      const result = await invoke<CompareResult>('compare_pack_sources', {
-        oldSource,
-        newSource,
-      })
-      setCompareResult(result)
-      let instanceAwarePlan: UpdatePlan | null = null
-      if (instanceDir) {
-        instanceAwarePlan = await invoke<UpdatePlan>('preview_update', {
-          instanceDir,
-          oldSource,
-          newSource,
-        })
-        setPlan(instanceAwarePlan)
-      }
-      setMessage(
-        instanceAwarePlan
-          ? locale === 'zh'
-            ? `源包差异完成：新增 ${result.diff.added.length}，更新 ${result.diff.updated.length}，删除 ${result.diff.removed.length}。实例待执行 ${instanceAwarePlan.added.length + instanceAwarePlan.updated.length + instanceAwarePlan.merged.length + instanceAwarePlan.removed.length + instanceAwarePlan.renamed.length}，已是最新 ${instanceAwarePlan.already_current.length}。`
-            : `Source diff complete: ${result.diff.added.length} added, ${result.diff.updated.length} updated, ${result.diff.removed.length} removed. Instance actions: ${instanceAwarePlan.added.length + instanceAwarePlan.updated.length + instanceAwarePlan.merged.length + instanceAwarePlan.removed.length + instanceAwarePlan.renamed.length}, already current: ${instanceAwarePlan.already_current.length}.`
-          : locale === 'zh'
-            ? `源包差异完成：新增 ${result.diff.added.length}，更新 ${result.diff.updated.length}，删除 ${result.diff.removed.length}。选择实例目录后可判断是否需要执行更新。`
-            : `Source diff complete: ${result.diff.added.length} added, ${result.diff.updated.length} updated, ${result.diff.removed.length} removed. Select an instance directory to determine whether apply is needed.`,
-      )
-    } catch (error) {
-      setMessage(String(error))
-    } finally {
-      setBusy('')
+  function updateFeedbackForm(patch: Partial<FeedbackFormState>) {
+    setFeedbackForm((current) => ({ ...current, ...patch }))
+  }
+
+  async function pickFeedbackAttachments() {
+    const selected = await open({
+      directory: false,
+      multiple: true,
+      filters: [
+        { name: 'Attachments', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'txt', 'log', 'json', 'zip'] },
+      ],
+    })
+    if (Array.isArray(selected)) {
+      updateFeedbackForm({ attachmentPaths: selected })
+    } else if (typeof selected === 'string') {
+      updateFeedbackForm({ attachmentPaths: [selected] })
     }
   }
 
-  async function scanInstance() {
-    if (!instanceDir) return
-    setBusy('instance-scan')
-    setMessage(locale === 'zh' ? '正在扫描选中的 Minecraft 实例...' : 'Scanning selected Minecraft instance...')
-    try {
-      const result = await invoke<PackManifest>('scan_pack_source', {
-        path: instanceDir,
-        options: null,
-      })
-      setInstanceManifest(result)
-      setMessage(locale === 'zh' ? `实例扫描完成：${result.files.length} 个文件。` : `Instance scan complete: ${result.files.length} files.`)
-      await refreshBackups()
-    } catch (error) {
-      setMessage(String(error))
-    } finally {
-      setBusy('')
+  function acceptDroppedPath(key: PreferencePathKey, setter: (path: string) => void, path: string | null) {
+    if (!path) {
+      setMessage(t.dropPathUnsupported)
+      return
     }
+    setter(path)
+    persistPreferences({ [key]: path })
   }
 
   async function runPreview() {
-    setBusy('compare')
-    setMessage(locale === 'zh' ? '正在扫描官方源并生成安全的文件级更新计划...' : 'Scanning official sources and building a safe file-level update plan...')
+    if (!canCheck) return
+    setBusy('preview')
+    setMessage(locale === 'zh' ? '正在检查更新计划...' : 'Checking update plan...')
     try {
-      const result = await invoke<UpdatePlan>('preview_update', {
-        instanceDir,
-        oldSource,
-        newSource,
-      })
-      setPlan(result)
-      setMessage(
-        locale === 'zh'
-          ? `计划已生成：新增 ${result.added.length}，更新 ${result.updated.length}，合并配置 ${result.merged.length}，删除 ${result.removed.length}，已是最新 ${result.already_current.length}，冲突 ${result.conflicts.length}。`
-          : `Plan generated: ${result.added.length} added, ${result.updated.length} updated, ${result.merged.length} config merges, ${result.removed.length} removed, ${result.already_current.length} already current, ${result.conflicts.length} conflicts.`,
-      )
-      await refreshBackups()
+      if (oldSource) {
+        const [compare, nextPlan] = await Promise.all([
+          invoke<CompareResult>('compare_pack_sources', { oldSource, newSource }),
+          invoke<UpdatePlan>('preview_update', { instanceDir, oldSource, newSource }),
+        ])
+        setCompareResult(compare)
+        setPlan(nextPlan)
+        setConservativePlan(null)
+        setMessage(nextPlan.conflicts.length ? t.conflictBody : t.safeBody)
+        recordAppLog(nextPlan.conflicts.length ? 'warn' : 'info', 'Baseline update preview completed', `${nextPlan.conflicts.length} conflicts`)
+      } else {
+        const nextPlan = await invoke<ConservativeUpdatePlan>('preview_conservative_update', {
+          instanceDir,
+          targetSource: newSource,
+        })
+        setConservativePlan(nextPlan)
+        setReviewChoices(Object.fromEntries(nextPlan.review_items.map((item) => [item.id, item.default_choice])))
+        setPlan(null)
+        setCompareResult(null)
+        setMessage(nextPlan.review_items.length ? t.conflictBody : t.safeBody)
+        recordAppLog(nextPlan.review_items.length ? 'warn' : 'info', 'Conservative update preview completed', `${nextPlan.review_items.length} review items`)
+      }
+      setSelectedDiffFile(null)
+      setDiffPreview(null)
+      await refreshBackups(true)
     } catch (error) {
       setMessage(String(error))
+      recordAppLog('error', 'Update preview failed', String(error))
     } finally {
       setBusy('')
     }
   }
 
   async function runApply() {
+    if (!canApply) return
+    operationSequence.current += 1
+    const operationId = `apply-${operationSequence.current}`
+    const activeMessage = locale === 'zh' ? '正在备份并应用更新...' : 'Backing up and applying update...'
     setBusy('apply')
-    setMessage(locale === 'zh' ? '正在创建备份并应用受保护的更新计划...' : 'Creating backup and applying the protected update plan...')
+    setMessage(activeMessage)
+    setOperationProgress({
+      operation_id: operationId,
+      stage: 'starting',
+      message: activeMessage,
+      current: 0,
+      total: 1,
+      percent: 0,
+      done: false,
+    })
     try {
-      const result = await invoke<ApplyResult>('apply_update', {
-        instanceDir,
-        oldSource,
-        newSource,
-      })
-      setLastApply(result)
-      setPlan(result.plan)
-      setMessage(
-        result.backup_id
-          ? locale === 'zh' ? `更新完成。备份 ID：${result.backup_id}。冲突：${result.plan.conflicts.length}。` : `Update complete. Backup ID: ${result.backup_id}. Conflicts: ${result.plan.conflicts.length}.`
-          : locale === 'zh' ? `无需更新。实例中的受管理文件已经是目标版本。` : `No update required. Managed files in the instance already match the target version.`,
-      )
-      await refreshBackups()
+      if (hasBaseline) {
+        const result = await invoke<ApplyResult>('apply_update_tracked', { operationId, instanceDir, oldSource, newSource })
+        setLastLogs(result.logs)
+        setPlan(result.plan)
+        setMessage(result.backup_id ? `${locale === 'zh' ? '更新完成，备份 ID' : 'Update complete. Backup ID'}: ${result.backup_id}` : locale === 'zh' ? '无需写入，已经是目标版本。' : 'No writes needed. Already at target version.')
+        recordAppLog('info', 'Baseline update apply completed', result.backup_id ?? 'no backup')
+      } else {
+        const result = await invoke<ConservativeApplyResult>('apply_conservative_update_tracked', {
+          operationId,
+          instanceDir,
+          targetSource: newSource,
+          reviewChoices,
+        })
+        setLastLogs(result.logs.map((log) => ({ level: 'info' as const, message: log })))
+        const nextPlan = await invoke<ConservativeUpdatePlan>('preview_conservative_update', {
+          instanceDir,
+          targetSource: newSource,
+        })
+        setConservativePlan(nextPlan)
+        setReviewChoices(Object.fromEntries(nextPlan.review_items.map((item) => [item.id, item.default_choice])))
+        setMessage(result.backup_id ? `${locale === 'zh' ? '更新完成，备份 ID' : 'Update complete. Backup ID'}: ${result.backup_id}` : locale === 'zh' ? '无需写入。' : 'No writes needed.')
+        recordAppLog('info', 'Conservative update apply completed', result.backup_id ?? 'no backup')
+      }
+      await refreshBackups(true)
     } catch (error) {
-      setMessage(String(error))
+      const errorMessage = String(error)
+      setMessage(errorMessage)
+      setOperationProgress((current) => ({
+        operation_id: current?.operation_id ?? operationId,
+        stage: 'failed',
+        message: errorMessage,
+        current: current?.current ?? 0,
+        total: current?.total ?? 1,
+        percent: current?.percent ?? 0,
+        path: current?.path,
+        done: true,
+      }))
+      recordAppLog('error', 'Update apply failed', errorMessage)
     } finally {
       setBusy('')
     }
   }
 
-  async function refreshBackups() {
+  async function refreshBackups(silent = false) {
     if (!instanceDir) return
-    setBusy('refresh')
+    if (!silent) setBusy('backups')
     try {
       const result = await invoke<BackupSummary[]>('list_backups', { instanceDir })
       setBackups(result)
-      setMessage(
-        result.length
-          ? locale === 'zh' ? `找到 ${result.length} 条备份记录。` : `Found ${result.length} backup records for this instance.`
-          : locale === 'zh' ? '此实例没有备份记录。' : 'No backup records found for this instance.',
-      )
+      if (!silent) setMessage(result.length ? `${result.length} ${t.backups}` : t.noBackups)
     } catch (error) {
-      setMessage(String(error))
+      if (!silent) setMessage(String(error))
     } finally {
-      setBusy('')
+      if (!silent) setBusy('')
     }
   }
 
   async function rollback(backupId: string) {
+    if (!instanceDir) return
     setBusy(`rollback:${backupId}`)
-    setMessage(locale === 'zh' ? `正在还原备份 ${backupId}...` : `Rolling back backup ${backupId}...`)
     try {
-      const result = await invoke<{ restored_files: number }>('rollback', {
-        instanceDir,
-        backupId,
-      })
-      setMessage(locale === 'zh' ? `还原完成。已恢复 ${result.restored_files} 个文件。` : `Rollback complete. Restored ${result.restored_files} files.`)
-      setPlan(null)
-      setLastApply(null)
-      await refreshBackups()
+      const result = await invoke<{ restored_files: number }>('rollback', { instanceDir, backupId })
+      setMessage(locale === 'zh' ? `已恢复 ${result.restored_files} 个文件。` : `Restored ${result.restored_files} files.`)
+      recordAppLog('info', 'Rollback completed', `${backupId}: ${result.restored_files} files`)
+      await refreshBackups(true)
     } catch (error) {
       setMessage(String(error))
+      recordAppLog('error', 'Rollback failed', String(error))
     } finally {
       setBusy('')
     }
@@ -781,75 +810,64 @@ function App() {
 
   async function openPackDelta() {
     if (!instanceDir) return
-    setBusy('packdelta')
-    try {
-      await invoke('open_folder', { path: `${instanceDir}\\.packdelta` })
-      setMessage(locale === 'zh' ? '已打开 .packdelta 状态目录。' : 'Opened the .packdelta state directory.')
-    } catch (error) {
-      setMessage(String(error))
-    } finally {
-      setBusy('')
-    }
+    await invoke('open_folder', { path: `${instanceDir}\\.packdelta` }).catch((error) => setMessage(String(error)))
   }
 
-  async function openConflictFolder() {
-    if (!instanceDir || !plan || !lastApply) return
-    setBusy('conflicts')
+  async function openDiffFile(file: DiffFileCandidate) {
+    setSelectedDiffFile(file)
+    setDiffPreview(null)
+    if (!newSource) return
     try {
-      await invoke('open_folder', { path: `${instanceDir}\\.packdelta\\conflicts\\${plan.from}_to_${plan.to}` })
-      setMessage(locale === 'zh' ? '已打开冲突候选目录。' : 'Opened the conflict candidate directory.')
+      const result = oldSource
+        ? await invoke<SourceDiffPreview>('read_source_diff', {
+          oldSource,
+          newSource,
+          path: file.path,
+        })
+        : await invoke<SourceDiffPreview>('read_source_diff', {
+          oldSource: instanceDir,
+          newSource,
+          path: file.path,
+        })
+      setDiffPreview(result)
     } catch (error) {
-      setMessage(String(error))
-    } finally {
-      setBusy('')
+      setDiffPreview({
+        path: file.path,
+        old_text: '',
+        new_text: String(error),
+        language: 'plaintext',
+        notice: t.diffUnavailable,
+      })
     }
   }
 
   async function saveUpdateSource() {
-    setBusy('save-app-source')
+    if (!updateSource) return
+    setBusy('save-update-source')
     try {
-      await invoke<UpdateSourceConfig>('save_update_source', { indexUrl: updateSource })
-      setMessage(locale === 'zh' ? '应用更新源已保存。' : 'Application update source saved.')
+      const result = await invoke<UpdateSourceConfig>('save_update_source', { indexUrl: updateSource })
+      setUpdateSource(result.index_url)
+      setMessage(locale === 'zh' ? '更新源已保存。' : 'Update source saved.')
+      recordAppLog('info', 'Update source saved', result.index_url)
     } catch (error) {
       setMessage(String(error))
+      recordAppLog('error', 'Saving update source failed', String(error))
     } finally {
       setBusy('')
     }
   }
 
   async function checkAppUpdate() {
+    if (!updateSource) return
     setBusy('check-app-update')
-    setMessage(locale === 'zh' ? '正在检查 Kairos Patch 的 GitHub 更新索引...' : 'Checking GitHub release index for Kairos Patch updates...')
     try {
       const result = await invoke<AppUpdateCheck>('check_app_update', { indexUrl: updateSource })
       setAppUpdate(result)
-      setDownloadedUpdate(null)
-      await fetchChangelog(false)
-      setMessage(
-        result.update_available
-          ? locale === 'zh' ? `Kairos Patch ${result.latest_version} 可用。当前版本：${result.current_version}。` : `Kairos Patch ${result.latest_version} is available. Current version: ${result.current_version}.`
-          : locale === 'zh' ? `Kairos Patch 已是最新：${result.current_version}。` : `Kairos Patch is up to date: ${result.current_version}.`,
-      )
+      setMessage(result.update_available ? `${t.latest}: ${result.latest_version}` : `${t.latest}: ${result.current_version}`)
+      recordAppLog('info', 'App update check completed', `${result.current_version} -> ${result.latest_version}`)
     } catch (error) {
       setMessage(String(error))
-    } finally {
-      setBusy('')
-    }
-  }
-
-  async function fetchChangelog(showMessage = true) {
-    setBusy('changelog')
-    if (showMessage) {
-      setMessage(locale === 'zh' ? '正在加载 GitHub 发布日志...' : 'Loading GitHub release changelog...')
-    }
-    try {
-      const result = await invoke<ChangelogRelease[]>('fetch_changelog', { indexUrl: updateSource })
-      setChangelog(result)
-      if (showMessage) {
-        setMessage(result.length ? (locale === 'zh' ? `已加载 ${result.length} 条 GitHub 发布日志。` : `Loaded ${result.length} GitHub release notes.`) : (locale === 'zh' ? '没有找到 GitHub 发布日志。' : 'No GitHub release notes found.'))
-      }
-    } catch (error) {
-      setMessage(String(error))
+      recordAppLog('error', 'App update check failed', String(error))
     } finally {
       setBusy('')
     }
@@ -858,15 +876,14 @@ function App() {
   async function downloadAppUpdate() {
     if (!appUpdate?.release) return
     setBusy('download-app-update')
-    setMessage(locale === 'zh' ? `正在下载 Kairos Patch ${appUpdate.release.version} 便携包...` : `Downloading Kairos Patch ${appUpdate.release.version} portable package...`)
     try {
-      const result = await invoke<DownloadedUpdate>('download_app_update', {
-        release: appUpdate.release,
-      })
+      const result = await invoke<DownloadedUpdate>('download_app_update', { release: appUpdate.release })
       setDownloadedUpdate(result)
-      setMessage(locale === 'zh' ? `便携更新包已下载并校验：${result.archive_path}` : `Portable update downloaded and verified: ${result.archive_path}`)
+      setMessage(result.archive_path)
+      recordAppLog('info', 'App update downloaded', result.archive_path)
     } catch (error) {
       setMessage(String(error))
+      recordAppLog('error', 'App update download failed', String(error))
     } finally {
       setBusy('')
     }
@@ -875,864 +892,583 @@ function App() {
   async function installPortableUpdate() {
     if (!downloadedUpdate) return
     setBusy('install-app-update')
-    setMessage(locale === 'zh' ? 'Kairos Patch 将关闭、替换便携文件并重启。' : 'Kairos Patch will close, replace the portable files, and restart.')
     try {
       await invoke('install_portable_update', { downloaded: downloadedUpdate })
     } catch (error) {
       setMessage(String(error))
+      recordAppLog('error', 'Portable update install failed', String(error))
+      setBusy('')
+    }
+  }
+
+  async function fetchChangelog() {
+    if (!updateSource) return
+    setBusy('changelog')
+    try {
+      const result = await invoke<ChangelogRelease[]>('fetch_changelog', { indexUrl: updateSource })
+      setChangelog(result)
+      recordAppLog('info', 'Changelog loaded', `${result.length} releases`)
+    } catch (error) {
+      setMessage(String(error))
+      recordAppLog('error', 'Changelog load failed', String(error))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function createFeedbackPackage() {
+    const title = feedbackForm.title.trim()
+    const description = feedbackForm.description.trim()
+    if (!title || !description) {
+      setMessage(locale === 'zh' ? '请填写反馈标题和描述。' : 'Title and description are required.')
+      return
+    }
+    setBusy('feedback')
+    try {
+      const result = await invoke<FeedbackPackage>('create_feedback_package', {
+        request: {
+          issue_type: feedbackForm.issueType,
+          title,
+          description,
+          reproduction_steps: feedbackForm.reproductionSteps.trim(),
+          include_logs: feedbackForm.includeLogs,
+          include_config: feedbackForm.includeConfig,
+          attachment_paths: feedbackForm.attachmentPaths,
+          contact: feedbackForm.contact.trim() || null,
+          instance_dir: instanceDir || null,
+          old_source: oldSource || null,
+          new_source: newSource || null,
+          update_source: updateSource || null,
+          patch_version: currentPatchVersion || null,
+          ui_logs: lastLogs,
+          open_issue: true,
+        },
+      })
+      setFeedbackPackage(result)
+      setMessage(result.archive_path)
+      recordAppLog('info', 'Feedback package created', result.archive_path)
+    } catch (error) {
+      setMessage(String(error))
+      recordAppLog('error', 'Feedback package creation failed', String(error))
+    } finally {
       setBusy('')
     }
   }
 
   return (
     <main className="app-shell" data-locale={locale}>
-      <section className="layout">
-        <aside className="sidebar">
-          <div className="brand-block">
-            <div className="logo-cube">
-              <Box size={28} />
-            </div>
-            <div>
-              <strong>Kairos Patch</strong>
-              <small>v{appVersion}</small>
-            </div>
+      <aside className="rail">
+        <div className="brand-mark">
+          <img src="/brand/kairos-patch-mark.svg" alt="Kairos Patch" />
+        </div>
+        <nav className="rail-nav" aria-label="Primary">
+          <button type="button" className={activePage === 'update' ? 'active' : ''} onClick={() => setActivePage('update')}>
+            <GitCompare size={17} />
+            <span>{t.update}</span>
+          </button>
+          <button type="button" className={activePage === 'backups' ? 'active' : ''} onClick={() => setActivePage('backups')}>
+            <ArchiveRestore size={17} />
+            <span>{t.backups}</span>
+          </button>
+          <button type="button" className={activePage === 'settings' ? 'active' : ''} onClick={() => setActivePage('settings')}>
+            <Settings size={17} />
+            <span>{t.settings}</span>
+          </button>
+        </nav>
+      </aside>
+
+      <section className="workspace">
+        <header className="topbar">
+          <div>
+            <strong>{t.title}</strong>
+            <span>v{appVersion}</span>
           </div>
+          <p>{t.subtitle}</p>
+        </header>
+        {operationProgress && (
+          <OperationToast
+            progress={operationProgress}
+            activeLabel={t.operationActive}
+            doneLabel={t.operationDone}
+            failedLabel={t.operationFailed}
+            onDismiss={() => setOperationProgress(null)}
+          />
+        )}
 
-          <nav className="nav-list" aria-label="Primary">
-            <button type="button" className={activePage === 'dashboard' ? 'active' : ''} onClick={() => setActivePage('dashboard')}>
-              <CircleDot size={16} /> {copy.dashboard}
-            </button>
-            <button type="button" className={activePage === 'diff' ? 'active' : ''} onClick={() => setActivePage('diff')}>
-              <GitCompare size={16} /> {copy.diff}
-            </button>
-            <button type="button" className={activePage === 'plan' ? 'active' : ''} onClick={() => setActivePage('plan')}>
-              <FileArchive size={16} /> {copy.plan}
-            </button>
-            <button type="button" className={activePage === 'backups' ? 'active' : ''} onClick={() => setActivePage('backups')}>
-              <ArchiveRestore size={16} /> {copy.backups}
-            </button>
-            <button type="button" className={activePage === 'instance' ? 'active' : ''} onClick={() => setActivePage('instance')}>
-              <HardDrive size={16} /> {copy.instance}
-            </button>
-            <button type="button" className={activePage === 'updates' ? 'active' : ''} onClick={() => setActivePage('updates')}>
-              <RefreshCw size={16} /> {copy.appUpdate}
-            </button>
-            <button type="button" className={activePage === 'changelog' ? 'active' : ''} onClick={() => setActivePage('changelog')}>
-              <History size={16} /> {copy.changelog}
-            </button>
-          </nav>
+        {activePage === 'update' && (
+          <section className="update-workbench utility-workbench">
+            <header className="utility-toolbar">
+              <div className="utility-title">
+                <strong>{displayName(instanceDir) || t.notSelected}</strong>
+                <span>{versionLabel}</span>
+              </div>
+              <span className={`task-status ${status.tone}`}>{status.label}</span>
+              <div className="utility-actions">
+                <button type="button" className="plain-button" onClick={runPreview} disabled={!canCheck}>
+                  <GitCompare size={15} />
+                  {t.compare}
+                </button>
+                <button type="button" className="plain-button strong" onClick={runApply} disabled={!canApply}>
+                  <Rocket size={15} />
+                  {t.apply}
+                </button>
+                <button type="button" className="icon-button" onClick={openPackDelta} disabled={!instanceDir} title={t.openState}>
+                  <FolderOpen size={15} />
+                </button>
+              </div>
+            </header>
 
-          <div className="language-switch" aria-label="Language">
-            <button type="button" className={locale === 'zh' ? 'active' : ''} onClick={() => changeLocale('zh')}>中文</button>
-            <button type="button" className={locale === 'en' ? 'active' : ''} onClick={() => changeLocale('en')}>EN</button>
-          </div>
-
-          <div className="sidebar-card">
-            <div className="pack-icon">
-              <Box size={22} />
-            </div>
-            <div>
-              <strong>{copy.selectedPack}</strong>
-              <span>{plan ? `${plan.from} -> ${plan.to}` : copy.noPlan}</span>
-            </div>
-            <small className="ready-dot">{plan ? copy.planned : copy.idle}</small>
-          </div>
-        </aside>
-
-        <section className="workspace">
-          <header className="hero-header">
-            <div>
-              <p className="eyebrow">{pageCopy.eyebrow}</p>
-              <h1>{pageCopy.title}</h1>
-              <span>{pageCopy.body}</span>
-            </div>
-            <div className={`status-pill ${busy ? 'busy' : ''}`}>
-              <span />
-              {busy ? copy.working : copy.ready}
-            </div>
-          </header>
-
-          {activePage === 'dashboard' && (
-            <>
-          <section className="source-grid" aria-label="Pack sources">
-            <SourceCard
-              icon={<HardDrive size={19} />}
-              title={copy.instanceDir}
-              badge={copy.inUse}
-              badgeTone="green"
-              value={instanceDir}
-              fallback={copy.selectInstance}
-              version={plan ? `${locale === 'zh' ? '实例基准' : 'Instance baseline'} ${plan.from}` : copy.waitingScan}
-              meta={instanceDir ? copy.selected : copy.required}
-              onPick={() => pickDirectory('instance_dir', setInstanceDir)}
-            />
-            <SourceCard
-              icon={<FolderOpen size={19} />}
-              title={copy.oldPack}
-              badge={copy.baseline}
-              badgeTone="amber"
-              value={oldSource}
-              fallback={copy.selectOld}
-              version={plan ? `${locale === 'zh' ? '当前基准' : 'Current baseline'} ${plan.from}` : copy.notScanned}
-              meta={oldSource ? copy.selected : copy.required}
-              onPick={() => pickDirectory('old_source', setOldSource)}
-              onPickZip={() => pickZipSource('old_source', setOldSource)}
-            />
-            <SourceCard
-              icon={<Sparkles size={19} />}
-              title={copy.newPack}
-              badge={copy.target}
-              badgeTone="violet"
-              value={newSource}
-              fallback={copy.selectNew}
-              version={plan ? `${locale === 'zh' ? '目标版本' : 'Target version'} ${plan.to}` : copy.notScanned}
-              meta={newSource ? copy.selected : copy.required}
-              onPick={() => pickDirectory('new_source', setNewSource)}
-              onPickZip={() => pickZipSource('new_source', setNewSource)}
-            />
-          </section>
-
-          <section className="action-row">
-            <button type="button" className="action-button primary" onClick={runPreview} disabled={!canPreview}>
-              <GitCompare size={18} />
-              <span>{copy.compare}</span>
-              <small>{copy.generatePlan}</small>
-            </button>
-            <button type="button" className="action-button" onClick={runApply} disabled={!canExecutePlan}>
-              <FileArchive size={18} />
-              <span>{copy.createBackup}</span>
-              <small>{locale === 'zh' ? '保护已修改文件' : 'Protect modified files'}</small>
-            </button>
-            <button type="button" className="action-button" onClick={openPackDelta} disabled={!instanceDir || Boolean(busy)}>
-              <Folder size={18} />
-              <span>{copy.openPackdelta}</span>
-              <small>{locale === 'zh' ? '打开状态目录' : 'Open state folder'}</small>
-            </button>
-            <button type="button" className="action-button compact" onClick={refreshBackups} disabled={!instanceDir || Boolean(busy)}>
-              <RefreshCw size={18} />
-              <span>{copy.refreshScan}</span>
-            </button>
-          </section>
-
-          <section className="stats-grid" aria-label="Update stats">
-            <Metric icon={<FileWarning size={22} />} label={copy.pendingChanges} value={totals.changed} tone="blue" />
-            <Metric icon={<FilePlus2 size={22} />} label={copy.addedFiles} value={totals.added} tone="green" />
-            <Metric icon={<RotateCcw size={22} />} label={copy.updatedFiles} value={totals.updated} tone="amber" />
-            <Metric icon={<Trash2 size={22} />} label={copy.removedFiles} value={totals.removed} tone="red" />
-            <Metric icon={<AlertTriangle size={22} />} label={copy.conflicts} value={totals.conflicts} tone="violet" />
-          </section>
-
-          <section className="content-grid">
-            <section className="panel diff-panel" id="diff">
-              <PanelHeader title={copy.diffPreview} subtitle={plan ? `${plan.from} -> ${plan.to}` : copy.runCompareHint} />
-              <DiffView plan={plan} copy={copy} />
+            <section className="utility-sources">
+              <SourcePicker
+                icon={<HardDrive size={15} />}
+                label={t.instance}
+                value={instanceDir}
+                fallback={t.selectInstance}
+                onPick={() => pickDirectory('instance_dir', setInstanceDir)}
+                dropHint={t.dropPath}
+                onDropPath={(path) => acceptDroppedPath('instance_dir', setInstanceDir, path)}
+              />
+              <SourcePicker
+                icon={<Folder size={15} />}
+                label={t.newPack}
+                value={newSource}
+                fallback={t.selectNew}
+                onPick={() => pickDirectory('new_source', setNewSource)}
+                onPickZip={() => pickZipSource('new_source', setNewSource)}
+                dropHint={t.dropPath}
+                onDropPath={(path) => acceptDroppedPath('new_source', setNewSource, path)}
+              />
+              <details className="baseline-field">
+                <summary>{t.oldPackAdvanced}</summary>
+                <SourcePicker
+                  icon={<FolderOpen size={15} />}
+                  label={t.oldPack}
+                  value={oldSource}
+                  fallback={t.selectOld}
+                  onPick={() => pickDirectory('old_source', setOldSource)}
+                  onPickZip={() => pickZipSource('old_source', setOldSource)}
+                  dropHint={t.dropPath}
+                  onDropPath={(path) => acceptDroppedPath('old_source', setOldSource, path)}
+                />
+              </details>
             </section>
 
-            <section className="panel plan-panel" id="plan">
-              <PanelHeader title={copy.updatePlan} subtitle={copy.estimated} />
-              <Stepper conflicts={totals.conflicts} hasPlan={Boolean(plan)} locale={locale} />
-            </section>
-
-            <aside className="right-stack">
-              <section className="panel side-panel" id="protection">
-                <div className="side-title">
-                  <span className="side-icon danger"><AlertTriangle size={22} /></span>
-                  <div>
-                    <h2>{copy.conflictProtection}</h2>
-                    <p>{plan ? `${totals.conflicts} ${copy.conflicts}, ${totals.protected} ${locale === 'zh' ? '个保留文件' : 'preserved files'}` : copy.checkConflicts}</p>
-                  </div>
+            <section className="tool-split">
+              <aside className="changes-pane">
+                <div className="pane-head">
+                  <h2>{t.changedFiles}</h2>
+                  <span>{diffFiles.length}</span>
                 </div>
-                <button type="button" className="ghost-button" onClick={openConflictFolder} disabled={!lastApply || !plan || !plan.conflicts.length || Boolean(busy)}>{locale === 'zh' ? '审阅' : 'Review'}</button>
-              </section>
-
-              <section className="panel side-panel" id="backups">
-                <div className="side-title">
-                  <span className="side-icon success"><ArchiveRestore size={22} /></span>
-                  <div>
-                    <h2>{copy.latestBackup}</h2>
-                    {backups.length ? (
-                      <p>{backups[0].from} {'->'} {backups[0].to} · {backups[0].file_count} {copy.files}</p>
-                    ) : (
-                      <p>{copy.noBackup}</p>
-                    )}
-                  </div>
+                <div className="change-list">
+                  {diffFiles.length ? diffFiles.slice(0, 140).map((file) => (
+                    <button
+                      type="button"
+                      className={`change-row ${file.tone} ${selectedDiffFile?.path === file.path ? 'active' : ''}`}
+                      key={`${file.tone}:${file.path}`}
+                      onClick={() => openDiffFile(file)}
+                    >
+                      <span className="change-kind">{file.tone === 'added' ? '+' : file.tone === 'removed' ? '-' : file.tone === 'conflict' ? '!' : file.tone === 'protected' ? '=' : '~'}</span>
+                      <span className="change-path">{file.path}</span>
+                      <small>{file.label}</small>
+                    </button>
+                  )) : (
+                    <div className="pane-empty">
+                      <span>{t.noPlan}</span>
+                      <small>{message || t.emptyPlanBody}</small>
+                    </div>
+                  )}
                 </div>
-                {backups[0] ? (
-                  <button type="button" className="ghost-button" onClick={() => rollback(backups[0].id)} disabled={Boolean(busy)}>
-                    {copy.restore}
-                  </button>
+
+                {conservativePlan?.review_items.length ? (
+                  <div className="review-inline">
+                    <div className="pane-head compact">
+                      <h2>{t.reviewItems}</h2>
+                      <span>{conservativePlan.review_items.length}</span>
+                    </div>
+                    {conservativePlan.review_items.map((item) => (
+                      <div className="review-row" key={item.id}>
+                        <button type="button" onClick={() => openDiffFile({ path: item.path, label: item.reason, tone: 'conflict' })}>
+                          <span>{item.mod_name ?? displayName(item.path)}</span>
+                          <small>{item.path}</small>
+                        </button>
+                        <select
+                          value={reviewChoices[item.id] ?? item.default_choice}
+                          onChange={(event) => setReviewChoices((current) => ({ ...current, [item.id]: event.target.value }))}
+                        >
+                          {item.choices.map((choice) => (
+                            <option key={choice} value={choice}>
+                              {{
+                                keep: t.keepChoice,
+                                remove: t.removeChoice,
+                                replace_with_target: t.replaceChoice,
+                                save_target_as_new: t.saveTargetChoice,
+                                use_target: t.replaceChoice,
+                              }[choice] ?? choice}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </aside>
+
+              <section className="diff-pane">
+                <div className="pane-head">
+                  <h2>{selectedDiffTitle}</h2>
+                  <span>{selectedDiffFile?.label ?? status.label}</span>
+                </div>
+                {diffPreview ? (
+                  <>
+                    {diffPreview.notice && <p className="diff-notice">{diffPreview.notice}</p>}
+                    <DiffEditor
+                      height="100%"
+                      language={diffPreview.language}
+                      original={diffPreview.old_text}
+                      modified={diffPreview.new_text}
+                      theme="vs"
+                      options={{
+                        readOnly: true,
+                        renderSideBySide: true,
+                        minimap: { enabled: false },
+                        fontSize: 12,
+                        lineNumbersMinChars: 3,
+                        scrollBeyondLastLine: false,
+                        wordWrap: 'on',
+                      }}
+                    />
+                  </>
                 ) : (
-                  <button type="button" className="ghost-button" onClick={refreshBackups} disabled={!instanceDir || Boolean(busy)}>
-                    {copy.check}
-                  </button>
+                  <div className="diff-empty">
+                    <GitCompare size={20} />
+                    <p>{selectedDiffFile ? t.diffUnavailable : t.noDiff}</p>
+                  </div>
                 )}
               </section>
+            </section>
 
-              <section className="panel instance-panel" id="instance">
-                <PanelHeader title={copy.instanceInfo} />
-                <InfoRow label={copy.instance} value={instanceDir || (locale === 'zh' ? '未选择' : 'Not selected')} />
-                <InfoRow label={locale === 'zh' ? '旧源包' : 'Old Source'} value={oldSource || (locale === 'zh' ? '未选择' : 'Not selected')} />
-                <InfoRow label={locale === 'zh' ? '新源包' : 'New Source'} value={newSource || (locale === 'zh' ? '未选择' : 'Not selected')} />
-                <InfoRow label={locale === 'zh' ? '当前' : 'Current'} value={plan?.from ?? copy.notScanned} />
-                <InfoRow label={copy.target} value={plan?.to ?? copy.notScanned} />
-                {lastApply && <InfoRow label={copy.lastBackup} value={lastApply.backup_id ?? (locale === 'zh' ? '无需备份' : 'No backup needed')} />}
-              </section>
-
-              <section className="panel operation-log-panel">
-                <PanelHeader title={locale === 'zh' ? '执行日志' : 'Operation Log'} subtitle={lastApply ? (locale === 'zh' ? '最近执行' : 'Latest run') : (plan ? (locale === 'zh' ? '计划日志' : 'Plan log') : copy.waiting)} />
-                <OperationLogView logs={lastApply?.logs ?? plan?.logs ?? []} locale={locale} />
-              </section>
-
-            </aside>
+            <footer className="utility-statusbar">
+              <span>{message || ((plan || conservativePlan) ? ((reviewCount > 0) ? t.conflictBody : t.safeBody) : t.emptyPlanBody)}</span>
+              <span>{automaticCount} {t.autoActions}</span>
+              <span>{reviewCount} {t.reviewItems}</span>
+              <span>{protectedCount} {t.protectedItems}</span>
+            </footer>
           </section>
+        )}
 
-          <footer className="execute-bar">
-            <button type="button" className="execute-button" onClick={runApply} disabled={!canExecutePlan}>
-              <Rocket size={20} />
-              <span>{copy.executePlan}</span>
-              <small>{copy.backupFirst}</small>
-            </button>
-            <div className="safety-note">
-              <ShieldCheck size={18} />
-              {copy.backupFirst}
+        {activePage === 'backups' && (
+          <section className="simple-page">
+            <div className="page-head">
+              <h1>{t.recentBackups}</h1>
+              <button type="button" className="plain-button" onClick={() => refreshBackups()} disabled={!instanceDir || Boolean(busy)}>
+                <RefreshCw size={16} />
+                {t.refresh}
+              </button>
             </div>
-          </footer>
-            </>
-          )}
+            <SourcePicker
+              icon={<HardDrive size={17} />}
+              label={t.instance}
+              value={instanceDir}
+              fallback={t.selectInstance}
+              onPick={() => pickDirectory('instance_dir', setInstanceDir)}
+              dropHint={t.dropPath}
+              onDropPath={(path) => acceptDroppedPath('instance_dir', setInstanceDir, path)}
+            />
+            <div className="backup-list">
+              {backups.length ? backups.map((backup) => (
+                <article className="backup-row" key={backup.id}>
+                  <div>
+                    <strong>{backup.from} {'->'} {backup.to}</strong>
+                    <span>{backup.id}</span>
+                  </div>
+                  <small>{backup.file_count} {t.files}</small>
+                  <button type="button" className="plain-button" onClick={() => rollback(backup.id)} disabled={Boolean(busy)}>
+                    {t.rollback}
+                  </button>
+                </article>
+              )) : <p className="quiet">{t.noBackups}</p>}
+            </div>
+          </section>
+        )}
 
-          {activePage === 'diff' && (
-            <section className="single-page-grid">
-              <section className="panel workflow-panel">
-                <PanelHeader title={copy.sourceSelection} subtitle={copy.oldVsNew} />
-                <div className="page-source-stack">
-                  <SourceCard
-                    icon={<FolderOpen size={19} />}
-                    title={copy.oldPack}
-                    badge={copy.baseline}
-                    badgeTone="amber"
-                    value={oldSource}
-                    fallback={copy.selectOld}
-                    version={compareResult ? compareResult.old_manifest.version : copy.notScanned}
-                    meta={oldSource ? copy.selected : copy.required}
-                    onPick={() => pickDirectory('old_source', setOldSource)}
-                    onPickZip={() => pickZipSource('old_source', setOldSource)}
+        {activePage === 'settings' && (
+          <section className="simple-page settings-page">
+            <div className="page-head">
+              <h1>{t.settings}</h1>
+            </div>
+            <section className="settings-section">
+              <h2>{t.language}</h2>
+              <div className="segmented">
+                <button type="button" className={locale === 'zh' ? 'active' : ''} onClick={() => changeLocale('zh')}>中文</button>
+                <button type="button" className={locale === 'en' ? 'active' : ''} onClick={() => changeLocale('en')}>EN</button>
+              </div>
+            </section>
+            <section className="settings-section">
+              <h2>{t.appUpdate}</h2>
+              <input
+                className="text-input"
+                value={updateSource}
+                onChange={(event) => setUpdateSource(event.target.value)}
+                placeholder="https://github.com/SevenThRe/karios-patch/releases/latest/download/release-index.json"
+              />
+              <div className="button-row">
+                <button type="button" className="plain-button" onClick={saveUpdateSource} disabled={!updateSource || Boolean(busy)}>{t.save}</button>
+                <button type="button" className="plain-button" onClick={checkAppUpdate} disabled={!updateSource || Boolean(busy)}>{t.check}</button>
+                <button type="button" className="plain-button" onClick={downloadAppUpdate} disabled={!appUpdate?.release || Boolean(busy)}><Download size={15} />{t.download}</button>
+                <button type="button" className="plain-button" onClick={installPortableUpdate} disabled={!downloadedUpdate || Boolean(busy)}>{t.install}</button>
+              </div>
+              <p className="quiet">{appUpdate ? `${appUpdate.current_version} -> ${appUpdate.latest_version}` : t.notChecked}</p>
+            </section>
+            <section className="settings-section">
+              <h2>{t.changelog}</h2>
+              <button type="button" className="plain-button" onClick={fetchChangelog} disabled={!updateSource || Boolean(busy)}>
+                <History size={15} />
+                {t.loadNotes}
+              </button>
+              <div className="changelog-list">
+                {changelog.slice(0, 5).map((release) => (
+                  <article key={release.url}>
+                    <strong>{release.title}</strong>
+                    <span>{release.version}</span>
+                  </article>
+                ))}
+              </div>
+            </section>
+            <section className="settings-section">
+              <h2>{t.feedback}</h2>
+              <p className="quiet">{t.feedbackBody}</p>
+              <div className="feedback-form">
+                <label>
+                  <span>{t.issueType}</span>
+                  <select
+                    className="text-input"
+                    value={feedbackForm.issueType}
+                    onChange={(event) => updateFeedbackForm({ issueType: event.target.value as FeedbackIssueType })}
+                  >
+                    {feedbackIssueTypes.map((issueType) => (
+                      <option key={issueType} value={issueType}>{issueType}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>{t.feedbackTitle}</span>
+                  <input
+                    className="text-input"
+                    value={feedbackForm.title}
+                    onChange={(event) => updateFeedbackForm({ title: event.target.value })}
+                    placeholder={t.feedbackTitlePlaceholder}
                   />
-                  <SourceCard
-                    icon={<Sparkles size={19} />}
-                    title={copy.newPack}
-                    badge={copy.target}
-                    badgeTone="violet"
-                    value={newSource}
-                    fallback={copy.selectNew}
-                    version={compareResult ? compareResult.new_manifest.version : copy.notScanned}
-                    meta={newSource ? copy.selected : copy.required}
-                    onPick={() => pickDirectory('new_source', setNewSource)}
-                    onPickZip={() => pickZipSource('new_source', setNewSource)}
+                </label>
+                <label className="wide">
+                  <span>{t.feedbackDescription}</span>
+                  <textarea
+                    className="text-area"
+                    value={feedbackForm.description}
+                    onChange={(event) => updateFeedbackForm({ description: event.target.value })}
+                    placeholder={t.feedbackDescriptionPlaceholder}
+                    rows={4}
                   />
+                </label>
+                <label className="wide">
+                  <span>{t.reproductionSteps}</span>
+                  <textarea
+                    className="text-area"
+                    value={feedbackForm.reproductionSteps}
+                    onChange={(event) => updateFeedbackForm({ reproductionSteps: event.target.value })}
+                    placeholder={t.reproductionStepsPlaceholder}
+                    rows={4}
+                  />
+                </label>
+                <div className="feedback-options">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={feedbackForm.includeLogs}
+                      onChange={(event) => updateFeedbackForm({ includeLogs: event.target.checked })}
+                    />
+                    <span>{t.includeLogs}</span>
+                  </label>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={feedbackForm.includeConfig}
+                      onChange={(event) => updateFeedbackForm({ includeConfig: event.target.checked })}
+                    />
+                    <span>{t.includeConfig}</span>
+                  </label>
                 </div>
-                <button type="button" className="action-button primary page-action" onClick={runCompareSources} disabled={!oldSource || !newSource || Boolean(busy)}>
-                  <GitCompare size={18} />
-                  <span>{copy.compareSources}</span>
-                  <small>{copy.scanBothPacks}</small>
+                <div className="feedback-attachments wide">
+                  <div>
+                    <span>{t.attachments}</span>
+                    <small>{feedbackForm.attachmentPaths.length ? feedbackForm.attachmentPaths.map(displayName).join(', ') : t.notSelected}</small>
+                  </div>
+                  <div className="button-row">
+                    <button type="button" className="plain-button" onClick={pickFeedbackAttachments} disabled={Boolean(busy)}>
+                      <Paperclip size={15} />
+                      {t.chooseAttachments}
+                    </button>
+                    <button type="button" className="plain-button" onClick={() => updateFeedbackForm({ attachmentPaths: [] })} disabled={!feedbackForm.attachmentPaths.length || Boolean(busy)}>
+                      {t.clearAttachments}
+                    </button>
+                  </div>
+                </div>
+                <label className="wide">
+                  <span>{t.contact}</span>
+                  <input
+                    className="text-input"
+                    value={feedbackForm.contact}
+                    onChange={(event) => updateFeedbackForm({ contact: event.target.value })}
+                    placeholder={t.contactPlaceholder}
+                  />
+                </label>
+              </div>
+              <div className="button-row">
+                <button type="button" className="plain-button" onClick={createFeedbackPackage} disabled={Boolean(busy)}>
+                  <Bug size={15} />
+                  {t.createFeedback}
                 </button>
-              </section>
-              <section className="panel diff-panel">
-                <PanelHeader
-                  title={copy.diffResult}
-                  subtitle={compareResult ? `${compareResult.old_manifest.pack_name} -> ${compareResult.new_manifest.pack_name}` : copy.waitingCompare}
-                />
-                <DiffResultView compareResult={compareResult} copy={copy} />
-              </section>
-            </section>
-          )}
-
-          {activePage === 'plan' && (
-            <section className="single-page-grid">
-              <section className="panel workflow-panel">
-                <PanelHeader title={copy.protectedPlan} subtitle={plan ? `${plan.from} -> ${plan.to}` : copy.notGenerated} />
-                <div className="page-source-stack">
-                  <SourceCard
-                    icon={<HardDrive size={19} />}
-                    title={copy.instanceDir}
-                    badge={copy.inUse}
-                    badgeTone="green"
-                    value={instanceDir}
-                    fallback={copy.selectInstance}
-                    version={plan ? `${locale === 'zh' ? '实例基准' : 'Instance baseline'} ${plan.from}` : copy.waitingScan}
-                    meta={instanceDir ? copy.selected : copy.required}
-                    onPick={() => pickDirectory('instance_dir', setInstanceDir)}
-                  />
-                  <SourceCard
-                    icon={<FolderOpen size={19} />}
-                    title={copy.oldPack}
-                    badge={copy.baseline}
-                    badgeTone="amber"
-                    value={oldSource}
-                    fallback={copy.selectOld}
-                    version={plan ? `${locale === 'zh' ? '当前基准' : 'Current baseline'} ${plan.from}` : copy.notScanned}
-                    meta={oldSource ? copy.selected : copy.required}
-                    onPick={() => pickDirectory('old_source', setOldSource)}
-                    onPickZip={() => pickZipSource('old_source', setOldSource)}
-                  />
-                  <SourceCard
-                    icon={<Sparkles size={19} />}
-                    title={copy.newPack}
-                    badge={copy.target}
-                    badgeTone="violet"
-                    value={newSource}
-                    fallback={copy.selectNew}
-                    version={plan ? `${locale === 'zh' ? '目标版本' : 'Target version'} ${plan.to}` : copy.notScanned}
-                    meta={newSource ? copy.selected : copy.required}
-                    onPick={() => pickDirectory('new_source', setNewSource)}
-                    onPickZip={() => pickZipSource('new_source', setNewSource)}
-                  />
+                {feedbackPackage && (
+                  <button type="button" className="plain-button" onClick={() => invoke('open_folder', { path: feedbackPackage.archive_path }).catch((error) => setMessage(String(error)))}>
+                    <ExternalLink size={15} />
+                    {t.diagnosticPackage}
+                  </button>
+                )}
+              </div>
+              {feedbackPackage && (
+                <div className="feedback-paths">
+                  <span>{t.diagnosticPackage}: {feedbackPackage.archive_path}</span>
+                  <span>{t.issueBody}: {feedbackPackage.issue_body_path}</span>
+                  <span>{t.appLogPath}: {feedbackPackage.app_log_path}</span>
                 </div>
-                <div className="page-button-row">
-                  <button type="button" className="action-button primary" onClick={runPreview} disabled={!canPreview}>
-                    <GitCompare size={18} />
-                    <span>{copy.generatePlan}</span>
-                    <small>{copy.buildPlanActions}</small>
-                  </button>
-                  <button type="button" className="action-button" onClick={runApply} disabled={!canExecutePlan}>
-                    <Rocket size={18} />
-                    <span>{copy.executePlan}</span>
-                    <small>{copy.backupThenWrite}</small>
-                  </button>
-                </div>
-              </section>
-              <section className="panel plan-panel">
-                <PanelHeader title={copy.planDetails} subtitle={locale === 'zh' ? `${totals.changed} 个变更，${totals.conflicts} 个冲突` : `${totals.changed} changed, ${totals.conflicts} conflicts`} />
-                <Stepper conflicts={totals.conflicts} hasPlan={Boolean(plan)} locale={locale} />
-                <ConflictList plan={plan} locale={locale} />
-                <OperationLogView logs={lastApply?.logs ?? plan?.logs ?? []} locale={locale} />
-              </section>
+              )}
             </section>
-          )}
-
-          {activePage === 'backups' && (
-            <section className="single-page-grid">
-              <section className="panel workflow-panel">
-                <PanelHeader title={copy.backupRecords} subtitle={backups.length ? (locale === 'zh' ? `找到 ${backups.length} 条` : `${backups.length} found`) : copy.instanceRequired} />
-                <SourceCard
-                  icon={<HardDrive size={19} />}
-                  title={copy.instanceDir}
-                  badge={copy.inUse}
-                  badgeTone="green"
-                  value={instanceDir}
-                  fallback={copy.selectInstance}
-                  version={instanceDir ? copy.selected : copy.waitingInstance}
-                  meta={instanceDir ? copy.readyBackupList : copy.required}
-                  onPick={() => pickDirectory('instance_dir', setInstanceDir)}
-                />
-                <button type="button" className="action-button primary page-action" onClick={refreshBackups} disabled={!instanceDir || Boolean(busy)}>
-                  <RefreshCw size={18} />
-                  <span>{copy.refreshScan}</span>
-                  <small>{copy.readBackups}</small>
-                </button>
+            {lastLogs.length > 0 && (
+              <section className="settings-section">
+                <h2>{t.lastLog}</h2>
+                <LogList logs={lastLogs} />
               </section>
-              <section className="panel backup-list-panel">
-                <PanelHeader title={copy.availableBackups} subtitle={copy.rollbackHint} />
-                <BackupList backups={backups} busy={busy} onRollback={rollback} copy={copy} />
-              </section>
-            </section>
-          )}
-
-          {activePage === 'instance' && (
-            <section className="single-page-grid">
-              <section className="panel workflow-panel">
-                <PanelHeader title={copy.instanceScan} subtitle={instanceManifest ? `${instanceManifest.files.length} ${copy.files}` : copy.notScanned} />
-                <SourceCard
-                  icon={<HardDrive size={19} />}
-                  title={copy.instanceDir}
-                  badge={copy.inUse}
-                  badgeTone="green"
-                  value={instanceDir}
-                  fallback={copy.selectInstance}
-                  version={instanceManifest?.pack_name ?? copy.waitingScan}
-                  meta={instanceDir ? copy.selected : copy.required}
-                  onPick={() => pickDirectory('instance_dir', setInstanceDir)}
-                />
-                <div className="page-button-row">
-                  <button type="button" className="action-button primary" onClick={scanInstance} disabled={!instanceDir || Boolean(busy)}>
-                    <HardDrive size={18} />
-                    <span>{copy.scanInstance}</span>
-                    <small>{copy.buildManifest}</small>
-                  </button>
-                  <button type="button" className="action-button" onClick={openPackDelta} disabled={!instanceDir || Boolean(busy)}>
-                    <Folder size={18} />
-                    <span>{copy.openPackdelta}</span>
-                    <small>{locale === 'zh' ? '打开状态目录' : 'Open state folder'}</small>
-                  </button>
-                </div>
-              </section>
-              <section className="panel instance-panel">
-                <PanelHeader title={copy.instanceManifest} subtitle={instanceManifest?.created_at ? new Date(instanceManifest.created_at).toLocaleString() : copy.waiting} />
-                <InfoRow label={copy.instance} value={instanceDir || (locale === 'zh' ? '未选择' : 'Not selected')} />
-                <InfoRow label={copy.packName} value={instanceManifest?.pack_name ?? copy.notScanned} />
-                <InfoRow label={copy.packId} value={instanceManifest?.pack_id ?? copy.notScanned} />
-                <InfoRow label={copy.version} value={instanceManifest?.version ?? copy.notScanned} />
-                <InfoRow label={copy.files} value={String(instanceManifest?.files.length ?? 0)} />
-                <FileTypeSummary manifest={instanceManifest} copy={copy} />
-              </section>
-            </section>
-          )}
-
-          {activePage === 'updates' && (
-            <section className="single-page-grid">
-              <section className="panel app-update-panel app-update-page">
-                <PanelHeader
-                  title={copy.portableUpdate}
-                  subtitle={appUpdate ? `${appUpdate.current_version} -> ${appUpdate.latest_version}` : `${copy.currentVersion} ${appVersion}`}
-                />
-                <input
-                  className="update-source-input"
-                  value={updateSource}
-                  onChange={(event) => setUpdateSource(event.target.value)}
-                  placeholder="https://github.com/SevenThRe/karios-patch/releases/latest/download/release-index.json"
-                />
-                <div className="update-controls">
-                  <button type="button" className="ghost-button" onClick={saveUpdateSource} disabled={!updateSource || Boolean(busy)}>
-                    {copy.save}
-                  </button>
-                  <button type="button" className="ghost-button" onClick={checkAppUpdate} disabled={!updateSource || Boolean(busy)}>
-                    {copy.check}
-                  </button>
-                  <button type="button" className="ghost-button" onClick={() => fetchChangelog()} disabled={!updateSource || Boolean(busy)}>
-                    {copy.notes}
-                  </button>
-                  <button type="button" className="ghost-button" onClick={downloadAppUpdate} disabled={!appUpdate?.release || Boolean(busy)}>
-                    {copy.download}
-                  </button>
-                  <button type="button" className="ghost-button" onClick={installPortableUpdate} disabled={!downloadedUpdate || Boolean(busy)}>
-                    {copy.apply}
-                  </button>
-                </div>
-                <p className="update-status">
-                  {downloadedUpdate
-                    ? `${copy.verified} ${downloadedUpdate.version}: ${downloadedUpdate.archive_path}`
-                    : appUpdate?.update_available
-                      ? `${copy.available}: ${appUpdate.latest_version}`
-                      : copy.updateSourceHint}
-                </p>
-              </section>
-
-              <section className="panel release-summary-panel">
-                <PanelHeader title={copy.releaseSource} subtitle="GitHub" />
-                <InfoRow label={copy.appVersion} value={appVersion} />
-                <InfoRow label={copy.latestChecked} value={appUpdate?.latest_version ?? copy.notChecked} />
-                <InfoRow label={copy.downloaded} value={downloadedUpdate?.version ?? copy.none} />
-                <InfoRow label={copy.updateSource} value={updateSource || copy.notConfigured} />
-              </section>
-            </section>
-          )}
-
-          {activePage === 'changelog' && (
-            <section className="single-page-grid">
-              <section className="panel changelog-panel changelog-page">
-                <PanelHeader title={copy.changelogTitle} subtitle={copy.githubReleases} />
-                <ChangelogView releases={changelog} onLoad={() => fetchChangelog()} disabled={!updateSource || Boolean(busy)} copy={copy} />
-              </section>
-            </section>
-          )}
-        </section>
+            )}
+          </section>
+        )}
       </section>
     </main>
   )
 }
 
-function SourceCard({
-  icon,
-  title,
-  badge,
-  badgeTone,
-  value,
-  fallback,
-  version,
-  meta,
-  onPick,
-  onPickZip,
+function OperationToast({
+  progress,
+  activeLabel,
+  doneLabel,
+  failedLabel,
+  onDismiss,
 }: {
-  icon: ReactNode
-  title: string
-  badge: string
-  badgeTone: 'green' | 'amber' | 'violet'
-  value: string
-  fallback: string
-  version: string
-  meta: string
-  onPick: () => void
-  onPickZip?: () => void
+  progress: OperationProgress
+  activeLabel: string
+  doneLabel: string
+  failedLabel: string
+  onDismiss: () => void
 }) {
+  const isFailed = progress.stage === 'failed'
+  const label = isFailed ? failedLabel : progress.done ? doneLabel : activeLabel
+  const hasMeasuredProgress = progress.total > 1
+
   return (
-    <article className="source-card">
-      <div className="source-head">
+    <section className={`operation-toast ${progress.done ? 'done' : 'active'} ${isFailed ? 'failed' : ''}`}>
+      <div className="operation-toast-head">
         <div>
-          <span className="source-icon">{icon}</span>
-          <h2>{title}</h2>
+          <strong>{label}</strong>
+          <span>{progress.stage}</span>
         </div>
-        <span className={`badge ${badgeTone}`}>{badge}</span>
+        <button type="button" onClick={onDismiss} aria-label="Dismiss"><X size={14} /></button>
       </div>
-      <div className="path-field" title={value || fallback}>
-        <span>{value || fallback}</span>
-        <button type="button" onClick={onPick} aria-label={`Select ${title}`}>
-          <Folder size={17} />
-        </button>
-        <button
-          type="button"
-          onClick={onPickZip}
-          disabled={!onPickZip}
-          aria-label={onPickZip ? `Select ${title} ZIP` : 'More options'}
-        >
-          <MoreHorizontal size={17} />
-        </button>
+      <p>{progress.message}</p>
+      {progress.path && <small title={progress.path}>{progress.path}</small>}
+      <div className={`operation-progress ${hasMeasuredProgress ? '' : 'indeterminate'}`}>
+        <span style={{ width: `${hasMeasuredProgress ? progress.percent : 45}%` }} />
       </div>
-      <div className="source-meta">
-        <span><CheckCircle2 size={16} /> {version}</span>
-        <small>{meta}</small>
-      </div>
-    </article>
+      <footer>
+        <span>{hasMeasuredProgress ? `${progress.percent}%` : ''}</span>
+        {hasMeasuredProgress && <span>{progress.current}/{progress.total}</span>}
+      </footer>
+    </section>
   )
 }
 
-function Metric({
+function SourcePicker({
   icon,
   label,
   value,
-  tone,
+  fallback,
+  onPick,
+  onPickZip,
+  dropHint,
+  onDropPath,
 }: {
-  icon: ReactNode
+  icon: React.ReactNode
   label: string
-  value: number
-  tone: 'blue' | 'green' | 'amber' | 'red' | 'violet'
+  value: string
+  fallback: string
+  onPick: () => void
+  onPickZip?: () => void
+  dropHint?: string
+  onDropPath?: (path: string | null) => void
 }) {
+  const [isDragging, setIsDragging] = useState(false)
+
+  function readDroppedPath(event: React.DragEvent<HTMLElement>) {
+    const file = event.dataTransfer.files.item(0) as (File & { path?: string }) | null
+    return file?.path || file?.webkitRelativePath || null
+  }
+
   return (
-    <article className={`metric ${tone}`}>
-      <span className="metric-icon">{icon}</span>
-      <div>
+    <article
+      className={`source-picker ${isDragging ? 'dragging' : ''}`}
+      onDragEnter={(event) => {
+        if (!onDropPath) return
+        event.preventDefault()
+        setIsDragging(true)
+      }}
+      onDragOver={(event) => {
+        if (!onDropPath) return
+        event.preventDefault()
+        event.dataTransfer.dropEffect = 'copy'
+      }}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+          setIsDragging(false)
+        }
+      }}
+      onDrop={(event) => {
+        if (!onDropPath) return
+        event.preventDefault()
+        setIsDragging(false)
+        onDropPath(readDroppedPath(event))
+      }}
+    >
+      <div className="source-label">
+        {icon}
         <span>{label}</span>
-        <strong>{value}</strong>
+      </div>
+      <div className="source-value" title={value || fallback}>{value || fallback}</div>
+      {dropHint && <div className="source-drop-hint">{dropHint}</div>}
+      <div className="source-buttons">
+        <button type="button" onClick={onPick} aria-label={label}><Folder size={16} /></button>
+        <button type="button" onClick={onPickZip} disabled={!onPickZip} aria-label="ZIP"><MoreHorizontal size={16} /></button>
       </div>
     </article>
   )
 }
 
-function PanelHeader({ title, subtitle }: { title: string; subtitle?: string }) {
+function LogList({ logs }: { logs: OperationLog[] }) {
   return (
-    <div className="panel-header">
-      <h2>{title}</h2>
-      {subtitle && <span>{subtitle}</span>}
-    </div>
-  )
-}
-
-function DiffView({ plan, copy }: { plan: UpdatePlan | null; copy: typeof i18n.zh }) {
-  if (!plan) {
-    return (
-      <div className="empty-state">
-        <GitCompare size={24} />
-        <strong>{copy.noComparison}</strong>
-        <p>{copy.noComparisonHint}</p>
-      </div>
-    )
-  }
-
-  const sections = [
-    { tone: 'green', title: copy.addedFiles, count: plan.added.length, items: plan.added.map((item) => item.path) },
-    { tone: 'amber', title: copy.updatedFiles, count: plan.updated.length + plan.renamed.length, items: [...plan.updated.map((item) => item.path), ...plan.renamed.map((item) => `${item.from} -> ${item.to}`)] },
-    { tone: 'blue', title: copy.mergedConfigs, count: plan.merged.length, items: plan.merged.map((item) => item.path) },
-    { tone: 'red', title: copy.removedFiles, count: plan.removed.length, items: plan.removed.map((item) => item.path) },
-    { tone: 'green', title: copy.dashboard === '仪表盘' ? '已是最新' : 'Already Current', count: plan.already_current.length, items: plan.already_current.map((item) => item.path) },
-    { tone: 'violet', title: copy.protectedUserFiles, count: plan.preserved.length, items: plan.preserved },
-  ]
-
-  return (
-    <div className="diff-list">
-      {sections.map((section) => (
-        <section className={`diff-section ${section.tone}`} key={section.title}>
-          <button type="button" className="diff-section-head">
-            <span>{section.title} <strong>({section.count})</strong></span>
-            <ChevronRight size={17} />
-          </button>
-          <ul>
-            {section.items.slice(0, 3).map((item) => (
-              <li key={item}>{item}</li>
-            ))}
-            {section.count > 3 && <li>... {section.count - 3} {copy.moreFiles}</li>}
-            {!section.items.length && <li>{copy.noFilesGroup}</li>}
-          </ul>
-        </section>
-      ))}
-    </div>
-  )
-}
-
-function DiffResultView({ compareResult, copy }: { compareResult: CompareResult | null; copy: typeof i18n.zh }) {
-  if (!compareResult) {
-    return (
-      <div className="empty-state">
-        <GitCompare size={24} />
-        <strong>{copy.sourceDiffEmpty}</strong>
-        <p>{copy.sourceDiffHint}</p>
-      </div>
-    )
-  }
-
-  const diff = compareResult.diff
-  const sections = [
-    { tone: 'green', title: copy.addedFiles, count: diff.added.length, items: diff.added.map((item) => item.path) },
-    { tone: 'amber', title: copy.updatedFiles, count: diff.updated.length, items: diff.updated.map((item) => item.new.path) },
-    { tone: 'red', title: copy.removedFiles, count: diff.removed.length, items: diff.removed.map((item) => item.path) },
-    { tone: 'violet', title: copy.renamedFiles, count: diff.renamed.length, items: diff.renamed.map((item) => `${item.old.path} -> ${item.new.path}`) },
-  ]
-
-  return (
-    <div className="diff-result-layout">
-      <div className="mini-metrics">
-        <Metric icon={<FilePlus2 size={22} />} label={copy.addedFiles} value={diff.added.length} tone="green" />
-        <Metric icon={<RotateCcw size={22} />} label={copy.updatedFiles} value={diff.updated.length + diff.renamed.length} tone="amber" />
-        <Metric icon={<Trash2 size={22} />} label={copy.removedFiles} value={diff.removed.length} tone="red" />
-      </div>
-      <div className="diff-list">
-        {sections.map((section) => (
-          <section className={`diff-section ${section.tone}`} key={section.title}>
-            <button type="button" className="diff-section-head">
-              <span>{section.title} <strong>({section.count})</strong></span>
-              <ChevronRight size={17} />
-            </button>
-            <ul>
-              {section.items.slice(0, 8).map((item) => (
-                <li key={item}>{item}</li>
-              ))}
-              {section.count > 8 && <li>... {section.count - 8} {copy.moreFiles}</li>}
-              {!section.items.length && <li>{copy.noFilesGroup}</li>}
-            </ul>
-          </section>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function OperationLogView({ logs, locale }: { logs: OperationLog[]; locale: Locale }) {
-  if (!logs.length) {
-    return (
-      <div className="inline-empty">
-        <FileArchive size={17} />
-        {locale === 'zh' ? '生成计划或执行更新后会显示逐步日志。' : 'Generate a plan or run an update to see step-by-step logs.'}
-      </div>
-    )
-  }
-
-  return (
-    <ol className="operation-log">
-      {logs.slice(-12).map((log, index) => (
+    <ol className="log-list">
+      {logs.slice(-8).map((log, index) => (
         <li className={log.level} key={`${index}:${log.message}`}>
-          <span>{log.level.toUpperCase()}</span>
+          <span>{log.level}</span>
           <p>{log.message}</p>
         </li>
       ))}
     </ol>
-  )
-}
-
-function ConflictList({ plan, locale }: { plan: UpdatePlan | null; locale: Locale }) {
-  if (!plan) {
-    return (
-      <div className="inline-empty">
-        <AlertTriangle size={17} />
-        {locale === 'zh' ? '生成计划后查看冲突和保留文件。' : 'Generate a plan to inspect conflicts and preserved files.'}
-      </div>
-    )
-  }
-
-  return (
-    <div className="conflict-list">
-      <section>
-        <h3>{locale === 'zh' ? '冲突' : 'Conflicts'}</h3>
-        <ul>
-          {plan.conflicts.map((conflict) => (
-            <li key={conflict.path}>
-              <strong>{conflict.path}</strong>
-              <span>{conflict.reason}</span>
-            </li>
-          ))}
-          {!plan.conflicts.length && <li>{locale === 'zh' ? '未检测到阻塞冲突' : 'No blocking conflicts detected'}</li>}
-        </ul>
-      </section>
-      <section>
-        <h3>{locale === 'zh' ? '保留的用户文件' : 'Preserved User Files'}</h3>
-        <ul>
-          {plan.preserved.slice(0, 10).map((path) => (
-            <li key={path}>{path}</li>
-          ))}
-          {plan.preserved.length > 10 && <li>... {plan.preserved.length - 10} {locale === 'zh' ? '个文件' : 'more files'}</li>}
-          {!plan.preserved.length && <li>{locale === 'zh' ? '此计划中没有保留的用户文件' : 'No preserved user files in this plan'}</li>}
-        </ul>
-      </section>
-    </div>
-  )
-}
-
-function BackupList({
-  backups,
-  busy,
-  onRollback,
-  copy,
-}: {
-  backups: BackupSummary[]
-  busy: string
-  onRollback: (backupId: string) => void
-  copy: typeof i18n.zh
-}) {
-  if (!backups.length) {
-    return (
-      <div className="empty-state compact-empty">
-        <ArchiveRestore size={24} />
-        <strong>{copy.noBackup}</strong>
-        <p>{copy.selectInstance}</p>
-      </div>
-    )
-  }
-
-  return (
-    <div className="backup-list">
-      {backups.map((backup) => (
-        <article className="backup-row" key={backup.id}>
-          <div>
-            <strong>{backup.from} {'->'} {backup.to}</strong>
-            <span>{backup.id}</span>
-          </div>
-          <small>{backup.file_count} {copy.files}</small>
-          <button type="button" className="ghost-button" onClick={() => onRollback(backup.id)} disabled={Boolean(busy)}>
-            {copy.restore}
-          </button>
-        </article>
-      ))}
-    </div>
-  )
-}
-
-function FileTypeSummary({ manifest, copy }: { manifest: PackManifest | null; copy: typeof i18n.zh }) {
-  if (!manifest) {
-    return (
-      <div className="inline-empty">
-        <HardDrive size={17} />
-        {copy.fileSummaryHint}
-      </div>
-    )
-  }
-
-  const counts = manifest.files.reduce<Record<string, number>>((acc, file) => {
-    acc[file.type] = (acc[file.type] ?? 0) + 1
-    return acc
-  }, {})
-
-  return (
-    <div className="file-type-summary">
-      {Object.entries(counts).map(([type, count]) => (
-        <InfoRow key={type} label={fileTypeLabel(type, copy)} value={String(count)} />
-      ))}
-    </div>
-  )
-}
-
-function fileTypeLabel(type: string, copy: typeof i18n.zh) {
-  if (copy.dashboard !== '仪表盘') {
-    return type
-  }
-  const labels: Record<string, string> = {
-    mod: '模组',
-    config: '配置',
-    script: '脚本',
-    resourcepack: '资源包',
-    shaderpack: '光影包',
-    save: '存档',
-    runtime: '运行时',
-    other: '其他',
-  }
-  return labels[type.toLowerCase()] ?? type
-}
-
-function ChangelogView({
-  releases,
-  onLoad,
-  disabled,
-  copy,
-}: {
-  releases: ChangelogRelease[]
-  onLoad: () => void
-  disabled: boolean
-  copy: typeof i18n.zh
-}) {
-  if (!releases.length) {
-    return (
-      <div className="empty-state compact-empty">
-        <History size={24} />
-        <strong>{copy.noChangelog}</strong>
-        <p>{copy.noChangelogHint}</p>
-        <button type="button" className="ghost-button" onClick={onLoad} disabled={disabled}>
-          {copy.loadNotes}
-        </button>
-      </div>
-    )
-  }
-
-  return (
-    <div className="changelog-list">
-      {releases.map((release) => (
-        <article className="changelog-release" key={release.url}>
-          <div className="changelog-head">
-            <div>
-              <strong>{release.title}</strong>
-              <span>{release.version}</span>
-            </div>
-            <a href={release.url} target="_blank" rel="noreferrer" aria-label={`Open ${release.version} on GitHub`}>
-              <ExternalLink size={16} />
-            </a>
-          </div>
-          {release.published_at && (
-            <small className="release-date">
-              <CalendarDays size={14} />
-              {new Date(release.published_at).toLocaleDateString()}
-            </small>
-          )}
-          <p>{release.body}</p>
-        </article>
-      ))}
-    </div>
-  )
-}
-
-function Stepper({ conflicts, hasPlan, locale = 'en' }: { conflicts: number; hasPlan: boolean; locale?: Locale }) {
-  const steps = [
-    { title: locale === 'zh' ? '验证' : 'Verify', body: locale === 'zh' ? '检查源映射和文件完整性' : 'Check source maps and file integrity' },
-    { title: locale === 'zh' ? '备份' : 'Backup', body: locale === 'zh' ? '复制可能被修改的文件' : 'Copy files that may be modified' },
-    { title: locale === 'zh' ? '应用变更' : 'Apply Changes', body: locale === 'zh' ? '写入官方包变更' : 'Write official pack changes' },
-    { title: locale === 'zh' ? '处理冲突' : 'Resolve Conflicts', body: conflicts ? (locale === 'zh' ? '需要手动审阅' : 'Manual review required') : (locale === 'zh' ? '未检测到阻塞冲突' : 'No blocking conflicts detected') },
-    { title: locale === 'zh' ? '完成' : 'Finish', body: locale === 'zh' ? '写入状态并清理临时文件' : 'Write state and clean temporary files' },
-  ]
-
-  return (
-    <ol className="stepper">
-      {steps.map((step, index) => (
-        <li className={hasPlan || index === 0 ? 'active' : ''} key={step.title}>
-          <span>{index + 1}</span>
-          <div>
-            <strong>{step.title}</strong>
-            <p>{step.body}</p>
-          </div>
-        </li>
-      ))}
-    </ol>
-  )
-}
-
-function InfoRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="info-row">
-      <span>{label}</span>
-      <strong title={value}>{value}</strong>
-    </div>
   )
 }
 

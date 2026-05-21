@@ -39,7 +39,10 @@ pub fn create_backup(
     files: Vec<BackupFile>,
     state_before: &InstanceState,
 ) -> AppResult<BackupManifest> {
-    let backup_dir = instance_dir.join(".packdelta").join("backups").join(backup_id);
+    let backup_dir = instance_dir
+        .join(".packdelta")
+        .join("backups")
+        .join(backup_id);
     fs::create_dir_all(backup_dir.join("files"))?;
     fs::write(
         backup_dir.join("state-before.json"),
@@ -59,7 +62,11 @@ pub fn create_backup(
     Ok(manifest)
 }
 
-pub fn copy_into_backup(instance_dir: &Path, backup_id: &str, relative_path: &str) -> AppResult<Option<BackupFile>> {
+pub fn copy_into_backup(
+    instance_dir: &Path,
+    backup_id: &str,
+    relative_path: &str,
+) -> AppResult<Option<BackupFile>> {
     let source = resolve_safe(instance_dir, relative_path)?;
     if !source.exists() {
         return Ok(None);
@@ -116,6 +123,12 @@ pub fn write_rollback_safety(instance_dir: &Path, backup_id: &str) -> AppResult<
 fn sanitize(value: &str) -> String {
     value
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' { ch } else { '_' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
         .collect()
 }

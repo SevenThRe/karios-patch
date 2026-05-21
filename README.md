@@ -1,73 +1,148 @@
-# React + TypeScript + Vite
+# Kairos Patch
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Kairos Patch is a Windows desktop workbench for updating Minecraft modpack instances while preserving user-owned files.
 
-Currently, two official plugins are available:
+It compares a current instance against a target modpack source, previews the planned file changes, protects local saves and player settings, and writes rollback data under `.packdelta`.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## What It Updates
 
-## React Compiler
+Kairos Patch treats these paths as pack-managed by default:
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- `mods/*.jar`
+- `defaultconfigs/**`
+- `kubejs/startup_scripts/**`
+- `kubejs/server_scripts/**`
+- `kubejs/client_scripts/**`
+- `scripts/**`
+- `libraries/**`
+- `packmenu/**`
 
-## Expanding the ESLint configuration
+These paths are treated as user-owned or protected by default:
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+- `config/**`
+- `resourcepacks/**`
+- `shaderpacks/**`
+- `saves/**`
+- `screenshots/**`
+- `logs/**`
+- `crash-reports/**`
+- `journeymap/**`
+- `xaero/**`
+- `options.txt`
+- `optionsof.txt`
+- `servers.dat`
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+Config files are merged conservatively when an old official source is available. Same-line local and official edits become review conflicts instead of being overwritten.
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+## Sources
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+The app accepts official pack sources as either:
+
+- an extracted folder
+- a `.zip` archive
+
+CurseForge-style `overrides/` paths are normalized to instance-relative paths.
+
+## Update Modes
+
+### Baseline Mode
+
+Provide all three inputs:
+
+- current instance
+- current baseline pack
+- target pack
+
+This is the precise mode. Kairos Patch can tell which files changed officially, which files changed locally, and which files can be safely replaced, merged, removed, or preserved.
+
+### Conservative Mode
+
+Provide:
+
+- current instance
+- target pack
+
+This mode does not assume historical knowledge. It previews safe automatic actions and review items. Unknown local files are kept unless the user explicitly chooses otherwise.
+
+## Rollback
+
+Before writing managed changes, Kairos Patch creates a backup under:
+
+```text
+<instance>/.packdelta/backups/
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Rollback restores backed-up files and removes files that became managed only after the selected backup. User extra files are preserved.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Feedback Diagnostics
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+The Settings page includes a feedback form for bugs, suggestions, install failures, update failures, and other reports. It creates a local diagnostic package and opens the GitHub Issue Form template.
+
+The form asks for:
+
+- issue type, title, description, and reproduction steps
+- explicit log upload consent
+- explicit config upload consent
+- optional screenshots or attachments
+- optional contact information
+
+The diagnostic package is written under the user's local application data directory and includes `report.json` plus `github-issue-body.md`. When the user opts in, it also includes recent app logs, a redacted config snapshot, `.packdelta/state.json`, recent conflict notes, and manually selected attachments.
+
+Automatic metadata is generated in the report with the tool name, tool version, patch version, Windows/architecture details, Java version, error fingerprint, the recent 500-line log tail when enabled, and the redacted config snapshot when enabled.
+
+The package is not uploaded silently. Users decide whether to attach the generated zip to the GitHub Issue.
+
+## Development
+
+Install dependencies:
+
+```powershell
+npm install
 ```
+
+Run the web shell:
+
+```powershell
+npm run dev
+```
+
+Run the desktop app:
+
+```powershell
+npm run tauri:dev
+```
+
+Build the frontend:
+
+```powershell
+npm run build
+```
+
+Run Rust tests:
+
+```powershell
+cd src-tauri
+cargo test
+```
+
+Run lint:
+
+```powershell
+npm run lint
+```
+
+## Portable Package
+
+Debug portable package:
+
+```powershell
+npm run portable:debug
+```
+
+Release portable package:
+
+```powershell
+npm run portable:release
+```
+
+The package script writes output under `dist-portable/`.

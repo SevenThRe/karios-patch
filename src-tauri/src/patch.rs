@@ -3,7 +3,11 @@ use crate::{
     diff::{ManifestDiff, RenamedFile, UpdatedFile},
     error::{AppError, AppResult, msg},
     hash::{sha256_bytes, sha256_file},
-    manifest::{FileType, ManifestFile, Owner, PackManifest, Strategy, read_source_file, resolve_safe, source_file_exists, write_manifest},
+    instance,
+    manifest::{
+        FileType, ManifestFile, Owner, PackManifest, Strategy, read_source_file, resolve_safe,
+        source_file_exists, write_manifest,
+    },
     state,
 };
 use serde::{Deserialize, Serialize};
@@ -66,6 +70,15 @@ pub struct ApplyResult {
     pub logs: Vec<OperationLog>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PatchProgress {
+    pub stage: &'static str,
+    pub message: String,
+    pub current: usize,
+    pub total: usize,
+    pub path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackResult {
     pub backup_id: String,
@@ -109,7 +122,10 @@ pub fn build_plan(
                 if current_hash == file.sha256 {
                     plan.mark_current(file);
                 } else {
-                    plan.log_warn(format!("Conflict: local file already exists for new official file {}", file.path));
+                    plan.log_warn(format!(
+                        "Conflict: local file already exists for new official file {}",
+                        file.path
+                    ));
                     plan.conflicts.push(Conflict {
                         path: file.path.clone(),
                         reason: "用户实例中已存在同名文件，保留用户文件".to_string(),
@@ -154,7 +170,10 @@ pub fn build_plan(
                     sha256: Some(new.sha256.clone()),
                 });
             } else {
-                plan.log_warn(format!("Conflict: local official file changed by user {}", old.path));
+                plan.log_warn(format!(
+                    "Conflict: local official file changed by user {}",
+                    old.path
+                ));
                 plan.conflicts.push(Conflict {
                     path: old.path.clone(),
                     reason: "用户修改过官方文件，保留本地文件，新官方文件写入冲突目录".to_string(),
@@ -171,9 +190,15 @@ pub fn build_plan(
         if is_apply_managed(old) && is_apply_managed(new) {
             let old_target = resolve_safe(instance_dir, &old.path)?;
             let new_target = resolve_safe(instance_dir, &new.path)?;
-            if new_target.exists() && sha256_file(&new_target)? == new.sha256 && !old_target.exists() {
+            if new_target.exists()
+                && sha256_file(&new_target)? == new.sha256
+                && !old_target.exists()
+            {
                 plan.mark_current(new);
-            } else if old_target.exists() && sha256_file(&old_target)? == old.sha256 && !new_target.exists() {
+            } else if old_target.exists()
+                && sha256_file(&old_target)? == old.sha256
+                && !new_target.exists()
+            {
                 plan.backup_candidates.push(old.path.clone());
                 plan.log_info(format!("Plan rename: {} -> {}", old.path, new.path));
                 plan.renamed.push(RenameAction {
@@ -182,7 +207,10 @@ pub fn build_plan(
                     sha256: new.sha256.clone(),
                 });
             } else {
-                plan.log_warn(format!("Conflict: rename is not safe {} -> {}", old.path, new.path));
+                plan.log_warn(format!(
+                    "Conflict: rename is not safe {} -> {}",
+                    old.path, new.path
+                ));
                 plan.conflicts.push(Conflict {
                     path: old.path.clone(),
                     reason: "重命名目标不安全或原文件已被用户修改".to_string(),
@@ -203,13 +231,74 @@ pub fn build_plan(
     Ok(plan)
 }
 
-pub fn apply_update(instance_dir: &Path, old_source: &Path, new_source: &Path, old_manifest: PackManifest, new_manifest: PackManifest) -> AppResult<ApplyResult> {
+pub fn apply_update(
+    instance_dir: &Path,
+    old_source: &Path,
+    new_source: &Path,
+    old_manifest: PackManifest,
+    new_manifest: PackManifest,
+) -> AppResult<ApplyResult> {
+    apply_update_with_progress(
+        instance_dir,
+        old_source,
+        new_source,
+        old_manifest,
+        new_manifest,
+        None,
+    )
+}
+
+pub fn apply_update_with_progress(
+    instance_dir: &Path,
+    old_source: &Path,
+    new_source: &Path,
+    old_manifest: PackManifest,
+    new_manifest: PackManifest,
+    mut on_progress: Option<&mut dyn FnMut(PatchProgress)>,
+) -> AppResult<ApplyResult> {
     if minecraft_running() {
         return msg("检测到 Minecraft/Java 游戏进程正在运行，请关闭游戏后再更新");
     }
 
     let diff = crate::diff::compare(&old_manifest, &new_manifest);
-    let mut plan = build_plan(instance_dir, old_source, new_source, &old_manifest, &new_manifest, &diff)?;
+    let mut plan = build_plan(
+        instance_dir,
+        old_source,
+        new_source,
+        &old_manifest,
+        &new_manifest,
+        &diff,
+    )?;
+    let mut backup_paths = plan.backup_candidates.clone();
+    for action in plan
+        .removed
+        .iter()
+        .chain(plan.updated.iter())
+        .chain(plan.merged.iter())
+    {
+        if !backup_paths.iter().any(|path| path == &action.path) {
+            backup_paths.push(action.path.clone());
+        }
+    }
+    dedupe(&mut backup_paths);
+
+    let total_units = backup_paths.len()
+        + plan.removed.len()
+        + plan.renamed.len()
+        + plan.updated.len()
+        + plan.merged.len()
+        + plan.added.len()
+        + plan.conflicts.len()
+        + 2;
+    let mut completed_units = 0usize;
+    report_patch_progress(
+        &mut on_progress,
+        "planning",
+        "Prepared update plan".to_string(),
+        completed_units,
+        total_units,
+        None,
+    );
     let manifest_sha = manifest_digest(&new_manifest)?;
     let mut current_state = match state::read_state(instance_dir)? {
         Some(existing) => existing,
@@ -217,7 +306,9 @@ pub fn apply_update(instance_dir: &Path, old_source: &Path, new_source: &Path, o
     };
 
     if !plan.has_work() {
-        plan.log_info("No update actions required; instance already matches the target managed files.");
+        plan.log_info(
+            "No update actions required; instance already matches the target managed files.",
+        );
         current_state = state::build_state(&new_manifest, manifest_sha);
         current_state.backups = state::read_state(instance_dir)?
             .map(|state| state.backups)
@@ -249,19 +340,28 @@ pub fn apply_update(instance_dir: &Path, old_source: &Path, new_source: &Path, o
 
     let backup_id = backup::make_backup_id(&old_manifest.version, &new_manifest.version);
     let mut backup_files = Vec::new();
-    for path in &plan.backup_candidates {
+    for path in &backup_paths {
         if let Some(file) = backup::copy_into_backup(instance_dir, &backup_id, path)? {
             backup_files.push(file);
         }
+        completed_units += 1;
+        report_patch_progress(
+            &mut on_progress,
+            "backup",
+            format!("Backed up: {}", path),
+            completed_units,
+            total_units,
+            Some(path.clone()),
+        );
     }
-    for action in plan.removed.iter().chain(plan.updated.iter()).chain(plan.merged.iter()) {
-        if !plan.backup_candidates.iter().any(|p| p == &action.path) {
-            if let Some(file) = backup::copy_into_backup(instance_dir, &backup_id, &action.path)? {
-                backup_files.push(file);
-            }
-        }
-    }
-    backup::create_backup(instance_dir, &backup_id, &old_manifest.version, &new_manifest.version, backup_files, &current_state)?;
+    backup::create_backup(
+        instance_dir,
+        &backup_id,
+        &old_manifest.version,
+        &new_manifest.version,
+        backup_files,
+        &current_state,
+    )?;
     plan.log_info(format!("Created backup: {}", backup_id));
 
     for action in plan.removed.clone() {
@@ -270,6 +370,15 @@ pub fn apply_update(instance_dir: &Path, old_source: &Path, new_source: &Path, o
             fs::remove_file(target)?;
             plan.log_info(format!("Removed: {}", action.path));
         }
+        completed_units += 1;
+        report_patch_progress(
+            &mut on_progress,
+            "writing",
+            format!("Removed: {}", action.path),
+            completed_units,
+            total_units,
+            Some(action.path.clone()),
+        );
     }
 
     for action in plan.renamed.clone() {
@@ -278,32 +387,105 @@ pub fn apply_update(instance_dir: &Path, old_source: &Path, new_source: &Path, o
         ensure_parent(&to)?;
         fs::rename(from, to)?;
         plan.log_info(format!("Renamed: {} -> {}", action.from, action.to));
+        completed_units += 1;
+        report_patch_progress(
+            &mut on_progress,
+            "writing",
+            format!("Renamed: {} -> {}", action.from, action.to),
+            completed_units,
+            total_units,
+            Some(action.to.clone()),
+        );
     }
 
     for update in plan.updated.clone() {
-        copy_from_source(new_source, instance_dir, &update.path, update.sha256.as_deref())?;
+        copy_from_source(
+            new_source,
+            instance_dir,
+            &update.path,
+            update.sha256.as_deref(),
+        )?;
         plan.log_info(format!("Updated: {}", update.path));
+        completed_units += 1;
+        report_patch_progress(
+            &mut on_progress,
+            "writing",
+            format!("Updated: {}", update.path),
+            completed_units,
+            total_units,
+            Some(update.path.clone()),
+        );
     }
     for merge in plan.merged.clone() {
-        merge_config_file(old_source, new_source, instance_dir, &merge.path, merge.sha256.as_deref())?;
+        merge_config_file(
+            old_source,
+            new_source,
+            instance_dir,
+            &merge.path,
+            merge.sha256.as_deref(),
+        )?;
         plan.log_info(format!("Merged config: {}", merge.path));
+        completed_units += 1;
+        report_patch_progress(
+            &mut on_progress,
+            "writing",
+            format!("Merged config: {}", merge.path),
+            completed_units,
+            total_units,
+            Some(merge.path.clone()),
+        );
     }
     for add in plan.added.clone() {
         copy_from_source(new_source, instance_dir, &add.path, add.sha256.as_deref())?;
         plan.log_info(format!("Added: {}", add.path));
+        completed_units += 1;
+        report_patch_progress(
+            &mut on_progress,
+            "writing",
+            format!("Added: {}", add.path),
+            completed_units,
+            total_units,
+            Some(add.path.clone()),
+        );
     }
 
     for conflict in plan.conflicts.clone() {
-        if let Some(new_file) = new_manifest.files.iter().find(|file| file.path == conflict.path) {
+        if let Some(new_file) = new_manifest
+            .files
+            .iter()
+            .find(|file| file.path == conflict.path)
+        {
             let conflict_root = instance_dir
                 .join(".packdelta")
                 .join("conflicts")
-                .join(format!("{}_to_{}", old_manifest.version, new_manifest.version));
-            copy_from_source(new_source, &conflict_root, &new_file.path, Some(&new_file.sha256))?;
+                .join(format!(
+                    "{}_to_{}",
+                    old_manifest.version, new_manifest.version
+                ));
+            copy_from_source(
+                new_source,
+                &conflict_root,
+                &new_file.path,
+                Some(&new_file.sha256),
+            )?;
             plan.log_warn(format!("Wrote conflict candidate: {}", new_file.path));
         }
+        completed_units += 1;
+        report_patch_progress(
+            &mut on_progress,
+            "conflicts",
+            format!("Wrote conflict candidate: {}", conflict.path),
+            completed_units,
+            total_units,
+            Some(conflict.path.clone()),
+        );
     }
-    write_conflict_notes(instance_dir, &old_manifest.version, &new_manifest.version, &plan)?;
+    write_conflict_notes(
+        instance_dir,
+        &old_manifest.version,
+        &new_manifest.version,
+        &plan,
+    )?;
 
     write_manifest(
         &instance_dir
@@ -331,8 +513,20 @@ pub fn apply_update(instance_dir: &Path, old_source: &Path, new_source: &Path, o
         new_manifest.version,
     ));
     state::write_state(instance_dir, &current_state)?;
+    completed_units = total_units;
+    report_patch_progress(
+        &mut on_progress,
+        "state",
+        "Wrote update state".to_string(),
+        completed_units,
+        total_units,
+        None,
+    );
     plan.conflicts.sort_by(|a, b| a.path.cmp(&b.path));
-    plan.log_info(format!("Wrote state: {}", state::state_path(instance_dir).display()));
+    plan.log_info(format!(
+        "Wrote state: {}",
+        state::state_path(instance_dir).display()
+    ));
     let logs = plan.logs.clone();
 
     Ok(ApplyResult {
@@ -341,6 +535,25 @@ pub fn apply_update(instance_dir: &Path, old_source: &Path, new_source: &Path, o
         state_path: state::state_path(instance_dir).display().to_string(),
         logs,
     })
+}
+
+fn report_patch_progress(
+    on_progress: &mut Option<&mut dyn FnMut(PatchProgress)>,
+    stage: &'static str,
+    message: String,
+    current: usize,
+    total: usize,
+    path: Option<String>,
+) {
+    if let Some(callback) = on_progress.as_deref_mut() {
+        callback(PatchProgress {
+            stage,
+            message,
+            current,
+            total,
+            path,
+        });
+    }
 }
 
 pub fn rollback(instance_dir: &Path, backup_id: &str) -> AppResult<RollbackResult> {
@@ -386,7 +599,11 @@ pub fn rollback(instance_dir: &Path, backup_id: &str) -> AppResult<RollbackResul
     })
 }
 
-fn handle_removed(instance_dir: &Path, file: &ManifestFile, plan: &mut UpdatePlan) -> AppResult<()> {
+fn handle_removed(
+    instance_dir: &Path,
+    file: &ManifestFile,
+    plan: &mut UpdatePlan,
+) -> AppResult<()> {
     if !is_apply_managed(file) {
         plan.preserved.push(file.path.clone());
         return Ok(());
@@ -405,7 +622,10 @@ fn handle_removed(instance_dir: &Path, file: &ManifestFile, plan: &mut UpdatePla
             sha256: Some(file.sha256.clone()),
         });
     } else {
-        plan.log_warn(format!("Conflict: remove target was changed locally {}", file.path));
+        plan.log_warn(format!(
+            "Conflict: remove target was changed locally {}",
+            file.path
+        ));
         plan.conflicts.push(Conflict {
             path: file.path.clone(),
             reason: "删除目标已被用户修改，保留本地文件".to_string(),
@@ -414,7 +634,11 @@ fn handle_removed(instance_dir: &Path, file: &ManifestFile, plan: &mut UpdatePla
     Ok(())
 }
 
-fn handle_added_config(instance_dir: &Path, file: &ManifestFile, plan: &mut UpdatePlan) -> AppResult<()> {
+fn handle_added_config(
+    instance_dir: &Path,
+    file: &ManifestFile,
+    plan: &mut UpdatePlan,
+) -> AppResult<()> {
     let target = resolve_safe(instance_dir, &file.path)?;
     if target.exists() {
         let current_hash = sha256_file(&target)?;
@@ -422,10 +646,14 @@ fn handle_added_config(instance_dir: &Path, file: &ManifestFile, plan: &mut Upda
             plan.mark_current(file);
         } else {
             plan.backup_candidates.push(file.path.clone());
-            plan.log_warn(format!("Conflict: new official config collides with local config {}", file.path));
+            plan.log_warn(format!(
+                "Conflict: new official config collides with local config {}",
+                file.path
+            ));
             plan.conflicts.push(Conflict {
                 path: file.path.clone(),
-                reason: "新官方 config 与本地同名配置冲突，需要手动选择保留本地或采用官方文件".to_string(),
+                reason: "新官方 config 与本地同名配置冲突，需要手动选择保留本地或采用官方文件"
+                    .to_string(),
             });
         }
     } else {
@@ -438,9 +666,17 @@ fn handle_added_config(instance_dir: &Path, file: &ManifestFile, plan: &mut Upda
     Ok(())
 }
 
-fn track_merged_configs(current_state: &mut state::InstanceState, new_manifest: &PackManifest, plan: &UpdatePlan) {
+fn track_merged_configs(
+    current_state: &mut state::InstanceState,
+    new_manifest: &PackManifest,
+    plan: &UpdatePlan,
+) {
     for merge in &plan.merged {
-        let Some(file) = new_manifest.files.iter().find(|file| file.path == merge.path) else {
+        let Some(file) = new_manifest
+            .files
+            .iter()
+            .find(|file| file.path == merge.path)
+        else {
             continue;
         };
         current_state.managed_files.insert(
@@ -454,7 +690,12 @@ fn track_merged_configs(current_state: &mut state::InstanceState, new_manifest: 
     }
 }
 
-fn write_conflict_notes(instance_dir: &Path, from: &str, to: &str, plan: &UpdatePlan) -> AppResult<()> {
+fn write_conflict_notes(
+    instance_dir: &Path,
+    from: &str,
+    to: &str,
+    plan: &UpdatePlan,
+) -> AppResult<()> {
     if plan.conflicts.is_empty() {
         return Ok(());
     }
@@ -500,7 +741,8 @@ fn handle_updated_config(
         return Ok(());
     }
     plan.backup_candidates.push(old.path.clone());
-    let can_auto_merge = can_merge_config(old_source, new_source, instance_dir, &old.path).unwrap_or(false);
+    let can_auto_merge =
+        can_merge_config(old_source, new_source, instance_dir, &old.path).unwrap_or(false);
     if current_hash == old.sha256 || can_auto_merge {
         plan.log_info(format!("Plan merge config: {}", new.path));
         plan.merged.push(FileAction {
@@ -508,7 +750,10 @@ fn handle_updated_config(
             sha256: Some(new.sha256.clone()),
         });
     } else {
-        plan.log_warn(format!("Conflict: config changed both locally and officially {}", old.path));
+        plan.log_warn(format!(
+            "Conflict: config changed both locally and officially {}",
+            old.path
+        ));
         plan.conflicts.push(Conflict {
             path: old.path.clone(),
             reason: "本地 config 与新版官方 config 修改了同一位置，需要手动决策".to_string(),
@@ -561,7 +806,12 @@ fn is_mergeable_config(file: &ManifestFile) -> bool {
     file.file_type == FileType::Config && matches!(file.strategy, Strategy::Merge)
 }
 
-fn can_merge_config(old_source: &Path, new_source: &Path, instance_dir: &Path, relative_path: &str) -> AppResult<bool> {
+fn can_merge_config(
+    old_source: &Path,
+    new_source: &Path,
+    instance_dir: &Path,
+    relative_path: &str,
+) -> AppResult<bool> {
     let old_text = read_utf8(old_source, relative_path)?;
     let local_text = read_utf8(instance_dir, relative_path)?;
     let new_text = read_utf8(new_source, relative_path)?;
@@ -579,7 +829,9 @@ fn merge_config_file(
     if let Some(expected) = expected_sha {
         let actual_sha = sha256_bytes(&new_bytes);
         if actual_sha != expected {
-            return Err(AppError::Message(format!("SHA256 校验失败: {relative_path}")));
+            return Err(AppError::Message(format!(
+                "SHA256 校验失败: {relative_path}"
+            )));
         }
     }
 
@@ -599,7 +851,9 @@ fn merge_config_file(
     let local_text = read_utf8(instance_dir, relative_path)?;
     let new_text = read_utf8(new_source, relative_path)?;
     let merged = merge_text(&old_text, &local_text, &new_text).ok_or_else(|| {
-        AppError::Message(format!("config 自动合并失败，需要手动处理: {relative_path}"))
+        AppError::Message(format!(
+            "config 自动合并失败，需要手动处理: {relative_path}"
+        ))
     })?;
     ensure_parent(&target)?;
     fs::write(target, merged)?;
@@ -608,8 +862,11 @@ fn merge_config_file(
 
 fn read_utf8(root: &Path, relative_path: &str) -> AppResult<String> {
     let bytes = read_source_file(root, relative_path)?;
-    String::from_utf8(bytes)
-        .map_err(|_| AppError::Message(format!("config 不是 UTF-8 文本，无法自动合并: {relative_path}")))
+    String::from_utf8(bytes).map_err(|_| {
+        AppError::Message(format!(
+            "config 不是 UTF-8 文本，无法自动合并: {relative_path}"
+        ))
+    })
 }
 
 fn merge_text(old: &str, local: &str, new: &str) -> Option<String> {
@@ -626,57 +883,187 @@ fn merge_text(old: &str, local: &str, new: &str) -> Option<String> {
     let old_lines = split_preserving_newlines(old);
     let local_lines = split_preserving_newlines(local);
     let new_lines = split_preserving_newlines(new);
-    let shared_len = old_lines.len();
+    let local_changes = diff_ranges(&old_lines, &local_lines);
+    let new_changes = diff_ranges(&old_lines, &new_lines);
 
-    if local_lines.len() < shared_len || new_lines.len() < shared_len {
-        return None;
-    }
-
-    let mut merged = Vec::new();
-    for index in 0..shared_len {
-        let old_line = old_lines[index];
-        let local_line = local_lines[index];
-        let new_line = new_lines[index];
-        if local_line == new_line {
-            merged.push(local_line);
-        } else if local_line == old_line {
-            merged.push(new_line);
-        } else if new_line == old_line {
-            merged.push(local_line);
-        } else {
-            return None;
-        }
-    }
-
-    if local_lines[shared_len..] == new_lines[shared_len..] {
-        merged.extend_from_slice(&local_lines[shared_len..]);
-    } else if local_lines.len() == shared_len {
-        merged.extend_from_slice(&new_lines[shared_len..]);
-    } else if new_lines.len() == shared_len {
-        merged.extend_from_slice(&local_lines[shared_len..]);
-    } else {
-        return None;
-    }
-
-    Some(merged.concat())
+    merge_ranges(&old_lines, &local_changes, &new_changes).map(|lines| lines.concat())
 }
 
-fn split_preserving_newlines(value: &str) -> Vec<&str> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LineChange {
+    start: usize,
+    end: usize,
+    replacement: Vec<String>,
+}
+
+fn split_preserving_newlines(value: &str) -> Vec<String> {
     let mut lines = Vec::new();
     let mut start = 0;
     for (index, ch) in value.char_indices() {
         if ch == '\n' {
-            lines.push(&value[start..=index]);
+            lines.push(value[start..=index].to_string());
             start = index + ch.len_utf8();
         }
     }
     if start < value.len() {
-        lines.push(&value[start..]);
+        lines.push(value[start..].to_string());
     }
     lines
 }
 
-fn copy_from_source(source_root: &Path, target_root: &Path, relative_path: &str, expected_sha: Option<&str>) -> AppResult<()> {
+fn diff_ranges(base: &[String], target: &[String]) -> Vec<LineChange> {
+    let matches = lcs_matches(base, target);
+    let mut ranges = Vec::new();
+    let mut base_pos = 0;
+    let mut target_pos = 0;
+
+    for (base_match, target_match) in matches {
+        if base_pos != base_match || target_pos != target_match {
+            ranges.push(LineChange {
+                start: base_pos,
+                end: base_match,
+                replacement: target[target_pos..target_match].to_vec(),
+            });
+        }
+        base_pos = base_match + 1;
+        target_pos = target_match + 1;
+    }
+
+    if base_pos != base.len() || target_pos != target.len() {
+        ranges.push(LineChange {
+            start: base_pos,
+            end: base.len(),
+            replacement: target[target_pos..].to_vec(),
+        });
+    }
+
+    ranges
+}
+
+fn lcs_matches(base: &[String], target: &[String]) -> Vec<(usize, usize)> {
+    let mut table = vec![vec![0usize; target.len() + 1]; base.len() + 1];
+    for base_index in (0..base.len()).rev() {
+        for target_index in (0..target.len()).rev() {
+            table[base_index][target_index] = if base[base_index] == target[target_index] {
+                table[base_index + 1][target_index + 1] + 1
+            } else {
+                table[base_index + 1][target_index].max(table[base_index][target_index + 1])
+            };
+        }
+    }
+
+    let mut matches = Vec::new();
+    let mut base_index = 0;
+    let mut target_index = 0;
+    while base_index < base.len() && target_index < target.len() {
+        if base[base_index] == target[target_index] {
+            matches.push((base_index, target_index));
+            base_index += 1;
+            target_index += 1;
+        } else if table[base_index + 1][target_index] >= table[base_index][target_index + 1] {
+            base_index += 1;
+        } else {
+            target_index += 1;
+        }
+    }
+    matches
+}
+
+fn merge_ranges(
+    base: &[String],
+    local_changes: &[LineChange],
+    new_changes: &[LineChange],
+) -> Option<Vec<String>> {
+    let mut merged = Vec::new();
+    let mut cursor = 0;
+    let mut local_index = 0;
+    let mut new_index = 0;
+
+    while local_index < local_changes.len() || new_index < new_changes.len() {
+        let local = local_changes.get(local_index);
+        let official = new_changes.get(new_index);
+        let next_start = match (local, official) {
+            (Some(local), Some(official)) => local.start.min(official.start),
+            (Some(local), None) => local.start,
+            (None, Some(official)) => official.start,
+            (None, None) => break,
+        };
+
+        if cursor < next_start {
+            merged.extend_from_slice(&base[cursor..next_start]);
+            cursor = next_start;
+        }
+
+        match (local, official) {
+            (Some(local), Some(official)) if local.start == official.start => {
+                if local == official {
+                    merged.extend_from_slice(&local.replacement);
+                    cursor = local.end;
+                    local_index += 1;
+                    new_index += 1;
+                } else if local.start == local.end && official.start == official.end {
+                    merged.extend_from_slice(&local.replacement);
+                    if local.replacement != official.replacement {
+                        merged.extend_from_slice(&official.replacement);
+                    }
+                    local_index += 1;
+                    new_index += 1;
+                } else if ranges_overlap(local, official) {
+                    return None;
+                } else if local.end <= official.start {
+                    merged.extend_from_slice(&local.replacement);
+                    cursor = local.end;
+                    local_index += 1;
+                } else {
+                    merged.extend_from_slice(&official.replacement);
+                    cursor = official.end;
+                    new_index += 1;
+                }
+            }
+            (Some(local), Some(official)) if local.start < official.start => {
+                if ranges_overlap(local, official) {
+                    return None;
+                }
+                merged.extend_from_slice(&local.replacement);
+                cursor = local.end;
+                local_index += 1;
+            }
+            (Some(local), None) => {
+                merged.extend_from_slice(&local.replacement);
+                cursor = local.end;
+                local_index += 1;
+            }
+            (None, Some(official)) => {
+                merged.extend_from_slice(&official.replacement);
+                cursor = official.end;
+                new_index += 1;
+            }
+            (Some(_), Some(official)) => {
+                merged.extend_from_slice(&official.replacement);
+                cursor = official.end;
+                new_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+
+    if cursor < base.len() {
+        merged.extend_from_slice(&base[cursor..]);
+    }
+
+    Some(merged)
+}
+
+fn ranges_overlap(left: &LineChange, right: &LineChange) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn copy_from_source(
+    source_root: &Path,
+    target_root: &Path,
+    relative_path: &str,
+    expected_sha: Option<&str>,
+) -> AppResult<()> {
     if !source_file_exists(source_root, relative_path)? {
         return Err(AppError::Message(format!(
             "源文件不存在: {} -> {}",
@@ -688,7 +1075,9 @@ fn copy_from_source(source_root: &Path, target_root: &Path, relative_path: &str,
     let actual_sha = sha256_bytes(&content);
     if let Some(expected) = expected_sha {
         if actual_sha != expected {
-            return Err(AppError::Message(format!("SHA256 校验失败: {relative_path}")));
+            return Err(AppError::Message(format!(
+                "SHA256 校验失败: {relative_path}"
+            )));
         }
     }
     let target = resolve_safe(target_root, relative_path)?;
@@ -705,13 +1094,7 @@ fn ensure_parent(path: &Path) -> AppResult<()> {
 }
 
 fn validate_instance(instance_dir: &Path) -> AppResult<()> {
-    if !instance_dir.exists() || !instance_dir.is_dir() {
-        return msg("目标实例目录不存在");
-    }
-    if !instance_dir.join("mods").is_dir() {
-        return msg("目标实例目录缺少 mods 目录，未通过 Minecraft 整合包结构检查");
-    }
-    Ok(())
+    instance::validate_game_directory(instance_dir)
 }
 
 fn manifest_digest(manifest: &PackManifest) -> AppResult<String> {
@@ -724,7 +1107,9 @@ fn minecraft_running() -> bool {
     if !cfg!(windows) {
         return false;
     }
-    let output = Command::new("tasklist").output();
+    let mut command = Command::new("tasklist");
+    hide_command_window(&mut command);
+    let output = command.output();
     let Ok(output) = output else {
         return false;
     };
@@ -736,6 +1121,17 @@ fn dedupe(values: &mut Vec<String>) {
     let mut set = BTreeSet::new();
     values.retain(|value| set.insert(value.clone()));
 }
+
+#[cfg(windows)]
+fn hide_command_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_command_window(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {
@@ -760,14 +1156,29 @@ mod tests {
         write_file(&instance, "mods/remove.jar", b"remove-me");
         write_file(&instance, "mods/user-extra.jar", b"user-extra");
 
-        let old_manifest = scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
-        let new_manifest = scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+        let old_manifest =
+            scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest =
+            scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
 
-        let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
+        let result = apply_update(
+            &instance,
+            &old_source,
+            &new_source,
+            old_manifest,
+            new_manifest,
+        )
+        .unwrap();
 
-        assert_eq!(fs::read(instance.join("mods/a.jar")).unwrap(), b"user-edited-a");
+        assert_eq!(
+            fs::read(instance.join("mods/a.jar")).unwrap(),
+            b"user-edited-a"
+        );
         assert_eq!(fs::read(instance.join("mods/b.jar")).unwrap(), b"new-b");
-        assert_eq!(fs::read(instance.join("mods/user-extra.jar")).unwrap(), b"user-extra");
+        assert_eq!(
+            fs::read(instance.join("mods/user-extra.jar")).unwrap(),
+            b"user-extra"
+        );
         assert!(!instance.join("mods/remove.jar").exists());
         assert_eq!(result.plan.conflicts.len(), 1);
         assert!(instance.join(".packdelta/state.json").exists());
@@ -788,15 +1199,30 @@ mod tests {
         write_file(&instance, "mods/remove.jar", b"remove-me");
         write_file(&instance, "mods/user-extra.jar", b"user-extra");
 
-        let old_manifest = scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
-        let new_manifest = scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+        let old_manifest =
+            scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest =
+            scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
 
-        let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
+        let result = apply_update(
+            &instance,
+            &old_source,
+            &new_source,
+            old_manifest,
+            new_manifest,
+        )
+        .unwrap();
         rollback(&instance, result.backup_id.as_deref().unwrap()).unwrap();
 
         assert_eq!(fs::read(instance.join("mods/a.jar")).unwrap(), b"old-a");
-        assert_eq!(fs::read(instance.join("mods/remove.jar")).unwrap(), b"remove-me");
-        assert_eq!(fs::read(instance.join("mods/user-extra.jar")).unwrap(), b"user-extra");
+        assert_eq!(
+            fs::read(instance.join("mods/remove.jar")).unwrap(),
+            b"remove-me"
+        );
+        assert_eq!(
+            fs::read(instance.join("mods/user-extra.jar")).unwrap(),
+            b"user-extra"
+        );
     }
 
     #[test]
@@ -809,18 +1235,79 @@ mod tests {
         write_file(&old_source, "mods/a.jar", b"old-a");
         write_file(&new_source, "mods/a.jar", b"old-a");
         write_file(&old_source, "config/app.toml", b"enabled=true\nlimit=1\n");
-        write_file(&new_source, "config/app.toml", b"enabled=true\nlimit=2\nnew-option=true\n");
+        write_file(
+            &new_source,
+            "config/app.toml",
+            b"enabled=true\nlimit=2\nnew-option=true\n",
+        );
         write_file(&instance, "mods/a.jar", b"old-a");
         write_file(&instance, "config/app.toml", b"enabled=false\nlimit=1\n");
 
-        let old_manifest = scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
-        let new_manifest = scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+        let old_manifest =
+            scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest =
+            scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
 
-        let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
+        let result = apply_update(
+            &instance,
+            &old_source,
+            &new_source,
+            old_manifest,
+            new_manifest,
+        )
+        .unwrap();
 
         assert_eq!(
             fs::read_to_string(instance.join("config/app.toml")).unwrap(),
             "enabled=false\nlimit=2\nnew-option=true\n"
+        );
+        assert_eq!(result.plan.merged.len(), 1);
+        assert!(result.plan.conflicts.is_empty());
+    }
+
+    #[test]
+    fn apply_preserves_user_inserted_config_lines_during_official_update() {
+        let temp = tempdir().unwrap();
+        let old_source = temp.path().join("old");
+        let new_source = temp.path().join("new");
+        let instance = temp.path().join("instance");
+
+        write_file(&old_source, "mods/a.jar", b"old-a");
+        write_file(&new_source, "mods/a.jar", b"old-a");
+        write_file(
+            &old_source,
+            "config/app.toml",
+            b"enabled=true\nlimit=1\nmode=normal\n",
+        );
+        write_file(
+            &new_source,
+            "config/app.toml",
+            b"enabled=true\nlimit=2\nmode=normal\n",
+        );
+        write_file(&instance, "mods/a.jar", b"old-a");
+        write_file(
+            &instance,
+            "config/app.toml",
+            b"enabled=true\nuser-note=keep-me\nlimit=1\nmode=normal\n",
+        );
+
+        let old_manifest =
+            scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest =
+            scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+
+        let result = apply_update(
+            &instance,
+            &old_source,
+            &new_source,
+            old_manifest,
+            new_manifest,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(instance.join("config/app.toml")).unwrap(),
+            "enabled=true\nuser-note=keep-me\nlimit=2\nmode=normal\n"
         );
         assert_eq!(result.plan.merged.len(), 1);
         assert!(result.plan.conflicts.is_empty());
@@ -839,17 +1326,31 @@ mod tests {
         write_file(&instance, "mods/a.jar", b"old-a");
         write_file(&instance, "config/legacy.toml", b"legacy=false\n");
 
-        let old_manifest = scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
-        let new_manifest = scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+        let old_manifest =
+            scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest =
+            scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
 
-        let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
+        let result = apply_update(
+            &instance,
+            &old_source,
+            &new_source,
+            old_manifest,
+            new_manifest,
+        )
+        .unwrap();
 
         assert_eq!(
             fs::read_to_string(instance.join("config/legacy.toml")).unwrap(),
             "legacy=false\n"
         );
         assert!(result.plan.removed.is_empty());
-        assert!(result.plan.preserved.contains(&"config/legacy.toml".to_string()));
+        assert!(
+            result
+                .plan
+                .preserved
+                .contains(&"config/legacy.toml".to_string())
+        );
     }
 
     #[test]
@@ -866,15 +1367,35 @@ mod tests {
         write_file(&instance, "mods/a.jar", b"old-a");
         write_file(&instance, "config/app.toml", b"limit=3\n");
 
-        let old_manifest = scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
-        let new_manifest = scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+        let old_manifest =
+            scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest =
+            scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
 
-        let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
+        let result = apply_update(
+            &instance,
+            &old_source,
+            &new_source,
+            old_manifest,
+            new_manifest,
+        )
+        .unwrap();
 
-        assert_eq!(fs::read_to_string(instance.join("config/app.toml")).unwrap(), "limit=3\n");
+        assert_eq!(
+            fs::read_to_string(instance.join("config/app.toml")).unwrap(),
+            "limit=3\n"
+        );
         assert_eq!(result.plan.conflicts.len(), 1);
-        assert!(instance.join(".packdelta/conflicts/1.0.0_to_1.0.1/config/app.toml").exists());
-        assert!(instance.join(".packdelta/conflicts/1.0.0_to_1.0.1/README.txt").exists());
+        assert!(
+            instance
+                .join(".packdelta/conflicts/1.0.0_to_1.0.1/config/app.toml")
+                .exists()
+        );
+        assert!(
+            instance
+                .join(".packdelta/conflicts/1.0.0_to_1.0.1/README.txt")
+                .exists()
+        );
     }
 
     #[test]
@@ -889,10 +1410,19 @@ mod tests {
         write_file(&new_source, "config/new.toml", b"enabled=true\n");
         write_file(&instance, "mods/a.jar", b"old-a");
 
-        let old_manifest = scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
-        let new_manifest = scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+        let old_manifest =
+            scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest =
+            scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
 
-        let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
+        let result = apply_update(
+            &instance,
+            &old_source,
+            &new_source,
+            old_manifest,
+            new_manifest,
+        )
+        .unwrap();
         assert!(instance.join("config/new.toml").exists());
 
         rollback(&instance, result.backup_id.as_deref().unwrap()).unwrap();
@@ -917,20 +1447,42 @@ mod tests {
         write_file(&instance, "mods/b.jar", b"new-b");
         write_file(&instance, "config/app.toml", b"limit=2\n");
 
-        let old_manifest = scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
-        let new_manifest = scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+        let old_manifest =
+            scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest =
+            scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
         let diff = crate::diff::compare(&old_manifest, &new_manifest);
-        let plan = build_plan(&instance, &old_source, &new_source, &old_manifest, &new_manifest, &diff).unwrap();
+        let plan = build_plan(
+            &instance,
+            &old_source,
+            &new_source,
+            &old_manifest,
+            &new_manifest,
+            &diff,
+        )
+        .unwrap();
 
         assert_eq!(plan.executable_action_count(), 0);
         assert!(plan.conflicts.is_empty());
         assert_eq!(plan.already_current.len(), 4);
 
-        let result = apply_update(&instance, &old_source, &new_source, old_manifest, new_manifest).unwrap();
+        let result = apply_update(
+            &instance,
+            &old_source,
+            &new_source,
+            old_manifest,
+            new_manifest,
+        )
+        .unwrap();
 
         assert!(result.backup_id.is_none());
         assert_eq!(result.plan.executable_action_count(), 0);
-        assert!(result.logs.iter().any(|log| log.message.contains("No update actions required")));
+        assert!(
+            result
+                .logs
+                .iter()
+                .any(|log| log.message.contains("No update actions required"))
+        );
     }
 
     #[test]
@@ -958,16 +1510,27 @@ mod tests {
         write_file(&instance, "mods/remove.jar", b"remove-me");
         write_file(&instance, "mods/user-extra.jar", b"user-extra");
 
-        let old_manifest = scan_pack_source(&old_zip, None, None, Some("1.0.0".to_string())).unwrap();
-        let new_manifest = scan_pack_source(&new_zip, None, None, Some("1.0.1".to_string())).unwrap();
+        let old_manifest =
+            scan_pack_source(&old_zip, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest =
+            scan_pack_source(&new_zip, None, None, Some("1.0.1".to_string())).unwrap();
 
-        assert!(old_manifest.files.iter().any(|file| file.path == "mods/a.jar"));
+        assert!(
+            old_manifest
+                .files
+                .iter()
+                .any(|file| file.path == "mods/a.jar")
+        );
 
-        let result = apply_update(&instance, &old_zip, &new_zip, old_manifest, new_manifest).unwrap();
+        let result =
+            apply_update(&instance, &old_zip, &new_zip, old_manifest, new_manifest).unwrap();
 
         assert_eq!(fs::read(instance.join("mods/a.jar")).unwrap(), b"new-a");
         assert_eq!(fs::read(instance.join("mods/b.jar")).unwrap(), b"new-b");
-        assert_eq!(fs::read(instance.join("mods/user-extra.jar")).unwrap(), b"user-extra");
+        assert_eq!(
+            fs::read(instance.join("mods/user-extra.jar")).unwrap(),
+            b"user-extra"
+        );
         assert!(!instance.join("mods/remove.jar").exists());
         assert!(result.plan.conflicts.is_empty());
     }
@@ -979,17 +1542,48 @@ mod tests {
 
         write_file(&source, "overrides/mods/a.jar", b"a");
         write_file(&source, "overrides/config/app.toml", b"enabled=true\n");
-        write_file(&source, "overrides/kubejs/server_scripts/main.js", b"ServerEvents.loaded(() => {})\n");
+        write_file(
+            &source,
+            "overrides/kubejs/server_scripts/main.js",
+            b"ServerEvents.loaded(() => {})\n",
+        );
 
         let manifest = scan_pack_source(&source, None, None, Some("1.0.0".to_string())).unwrap();
 
         assert!(manifest.files.iter().any(|file| file.path == "mods/a.jar"));
-        assert!(manifest.files.iter().any(|file| file.path == "config/app.toml"));
-        assert!(manifest.files.iter().any(|file| file.path == "kubejs/server_scripts/main.js"));
-        assert!(!manifest.files.iter().any(|file| file.path.starts_with("overrides/")));
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|file| file.path == "config/app.toml")
+        );
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|file| file.path == "kubejs/server_scripts/main.js")
+        );
+        assert!(
+            !manifest
+                .files
+                .iter()
+                .any(|file| file.path.starts_with("overrides/"))
+        );
     }
 
     fn write_file(root: &Path, relative: &str, content: &[u8]) {
+        if root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "instance")
+            && relative.starts_with("mods/")
+        {
+            let marker = root.join("options.txt");
+            if !marker.exists() {
+                fs::create_dir_all(root).unwrap();
+                fs::write(&marker, b"").unwrap();
+            }
+        }
         let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();

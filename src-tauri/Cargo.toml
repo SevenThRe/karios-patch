@@ -23,3 +23,9 @@ zip = "5"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+opt-level = 2
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

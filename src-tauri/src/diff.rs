@@ -35,7 +35,9 @@ pub fn compare(old: &PackManifest, new: &PackManifest) -> ManifestDiff {
 
     for old_file in &old.files {
         match new_by_path.get(old_file.path.as_str()) {
-            Some(new_file) if new_file.sha256 == old_file.sha256 => unchanged.push((*new_file).clone()),
+            Some(new_file) if new_file.sha256 == old_file.sha256 => {
+                unchanged.push((*new_file).clone())
+            }
             Some(new_file) => updated.push(UpdatedFile {
                 old: old_file.clone(),
                 new: (*new_file).clone(),
@@ -55,10 +57,8 @@ pub fn compare(old: &PackManifest, new: &PackManifest) -> ManifestDiff {
     let mut renamed = Vec::new();
 
     for (old_index, old_file) in raw_removed.iter().enumerate() {
-        if let Some((new_index, new_file)) = raw_added
-            .iter()
-            .enumerate()
-            .find(|(index, candidate)| {
+        if let Some((new_index, new_file)) =
+            raw_added.iter().enumerate().find(|(index, candidate)| {
                 !used_added.contains(index) && candidate.sha256 == old_file.sha256
             })
         {

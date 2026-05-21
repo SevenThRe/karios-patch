@@ -1,9 +1,12 @@
-use crate::{error::{AppError, AppResult}, hash::{sha256_bytes, sha256_file}};
+use crate::{
+    error::{AppError, AppResult},
+    hash::{sha256_file, sha256_reader},
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io::{Cursor, Read},
+    fs::{self, File},
+    io::Read,
     path::{Component, Path, PathBuf},
 };
 use walkdir::WalkDir;
@@ -72,19 +75,43 @@ pub enum FileType {
     Other,
 }
 
+#[derive(Debug, Clone)]
+pub struct ManifestScanProgress {
+    pub source: String,
+    pub current: usize,
+    pub total: usize,
+    pub path: Option<String>,
+}
+
 pub fn scan_pack_source(
     root: &Path,
     pack_id: Option<String>,
     pack_name: Option<String>,
     version: Option<String>,
 ) -> AppResult<PackManifest> {
+    scan_pack_source_with_progress(root, pack_id, pack_name, version, None)
+}
+
+pub fn scan_pack_source_with_progress(
+    root: &Path,
+    pack_id: Option<String>,
+    pack_name: Option<String>,
+    version: Option<String>,
+    mut on_progress: Option<&mut dyn FnMut(ManifestScanProgress)>,
+) -> AppResult<PackManifest> {
     if is_zip_source(root) {
-        return scan_zip_pack_source(root, pack_id, pack_name, version);
+        return scan_zip_pack_source(root, pack_id, pack_name, version, on_progress);
     }
 
+    let source = root.display().to_string();
     let mut files = Vec::new();
+    let mut candidates = Vec::new();
 
-    for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -94,17 +121,25 @@ pub fn scan_pack_source(
             continue;
         }
 
-        let metadata = fs::metadata(path)?;
+        candidates.push((path.to_path_buf(), rel));
+    }
+
+    let total = candidates.len();
+    for (index, (path, rel)) in candidates.into_iter().enumerate() {
+        report_manifest_progress(&mut on_progress, &source, index, total, Some(rel.clone()));
+
+        let metadata = fs::metadata(&path)?;
         let (owner, strategy, file_type) = classify(&rel);
         files.push(ManifestFile {
             path: rel,
-            sha256: sha256_file(path)?,
+            sha256: sha256_file(&path)?,
             size: metadata.len(),
             owner,
             strategy,
             file_type,
         });
     }
+    report_manifest_progress(&mut on_progress, &source, total, total, None);
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
     let fallback_name = root
@@ -134,7 +169,7 @@ pub fn read_source_file(source: &Path, relative_path: &str) -> AppResult<Vec<u8>
 
 pub fn source_file_exists(source: &Path, relative_path: &str) -> AppResult<bool> {
     if is_zip_source(source) {
-        return Ok(read_zip_source_file(source, relative_path).is_ok());
+        return zip_source_file_exists(source, relative_path);
     }
     Ok(resolve_safe(source, relative_path)?.exists())
 }
@@ -174,11 +209,14 @@ fn scan_zip_pack_source(
     pack_id: Option<String>,
     pack_name: Option<String>,
     version: Option<String>,
+    mut on_progress: Option<&mut dyn FnMut(ManifestScanProgress)>,
 ) -> AppResult<PackManifest> {
-    let bytes = fs::read(zip_path)?;
-    let mut archive = ZipArchive::new(Cursor::new(bytes))
-        .map_err(|error| AppError::Message(error.to_string()))?;
+    let source = zip_path.display().to_string();
+    let file = File::open(zip_path)?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|error| AppError::Message(error.to_string()))?;
     let mut files = Vec::new();
+    let total = archive.len();
 
     for index in 0..archive.len() {
         let mut entry = archive
@@ -193,18 +231,20 @@ fn scan_zip_pack_source(
         if should_skip(&rel) {
             continue;
         }
-        let mut content = Vec::new();
-        entry.read_to_end(&mut content)?;
+        report_manifest_progress(&mut on_progress, &source, index, total, Some(rel.clone()));
+        let size = entry.size();
+        let sha256 = sha256_reader(&mut entry)?;
         let (owner, strategy, file_type) = classify(&rel);
         files.push(ManifestFile {
             path: rel,
-            sha256: sha256_bytes(&content),
-            size: content.len() as u64,
+            sha256,
+            size,
             owner,
             strategy,
             file_type,
         });
     }
+    report_manifest_progress(&mut on_progress, &source, total, total, None);
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
     let fallback_name = zip_path
@@ -229,9 +269,9 @@ fn read_zip_source_file(zip_path: &Path, relative_path: &str) -> AppResult<Vec<u
     if Path::new(relative_path).is_absolute() || relative_path.contains("..") {
         return Err(AppError::UnsafePath(relative_path.to_string()));
     }
-    let bytes = fs::read(zip_path)?;
-    let mut archive = ZipArchive::new(Cursor::new(bytes))
-        .map_err(|error| AppError::Message(error.to_string()))?;
+    let file = File::open(zip_path)?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|error| AppError::Message(error.to_string()))?;
 
     for index in 0..archive.len() {
         let mut entry = archive
@@ -253,6 +293,47 @@ fn read_zip_source_file(zip_path: &Path, relative_path: &str) -> AppResult<Vec<u
         zip_path.display(),
         relative_path
     )))
+}
+
+fn zip_source_file_exists(zip_path: &Path, relative_path: &str) -> AppResult<bool> {
+    if Path::new(relative_path).is_absolute() || relative_path.contains("..") {
+        return Err(AppError::UnsafePath(relative_path.to_string()));
+    }
+    let file = File::open(zip_path)?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|error| AppError::Message(error.to_string()))?;
+
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|error| AppError::Message(error.to_string()))?;
+        if entry.is_dir() {
+            continue;
+        }
+        if normalize_zip_entry_name(entry.name()).as_deref() != Some(relative_path) {
+            continue;
+        }
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn report_manifest_progress(
+    on_progress: &mut Option<&mut dyn FnMut(ManifestScanProgress)>,
+    source: &str,
+    current: usize,
+    total: usize,
+    path: Option<String>,
+) {
+    if let Some(callback) = on_progress.as_deref_mut() {
+        callback(ManifestScanProgress {
+            source: source.to_string(),
+            current,
+            total,
+            path,
+        });
+    }
 }
 
 fn normalize_zip_entry_name(name: &str) -> Option<String> {

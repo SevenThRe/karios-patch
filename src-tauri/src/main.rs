@@ -1,8 +1,12 @@
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
+
 mod backup;
 mod commands;
+mod diagnostics;
 mod diff;
 mod error;
 mod hash;
+mod instance;
 mod manifest;
 mod patch;
 mod preferences;
@@ -16,8 +20,13 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::scan_pack_source,
             commands::compare_pack_sources,
+            commands::read_source_diff,
+            commands::preview_conservative_update,
+            commands::apply_conservative_update,
+            commands::apply_conservative_update_tracked,
             commands::preview_update,
             commands::apply_update,
+            commands::apply_update_tracked,
             commands::list_backups,
             commands::rollback,
             commands::open_folder,
@@ -28,7 +37,9 @@ fn main() {
             commands::check_app_update,
             commands::fetch_changelog,
             commands::download_app_update,
-            commands::install_portable_update
+            commands::install_portable_update,
+            commands::append_app_log,
+            commands::create_feedback_package
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Kairos Patch");
