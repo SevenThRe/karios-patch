@@ -19,3 +19,5 @@
 - Resolved: No-baseline preview exposed local-only mods as review items, but applying those review choices was not implemented yet. The UI now calls `apply_conservative_update` with review choices, and the backend validates choices before writing.
 - Resolved: The first feedback flow opened a plain GitHub Issue body and did not expose the requested structured fields, consent toggles, attachment handling, or automatic metadata contract. Feedback now uses an Issue Form template and local structured diagnostics.
 - Resolved: Instance validation accepted any directory with `mods/` in baseline mode and only checked existence in no-baseline mode. Both paths now require a Minecraft game-directory marker such as `.minecraft`, `versions/`, launcher metadata, or an isolated version directory.
+- Resolved: The operation toast could show `Update completed` while the indeterminate progress animation kept moving because the completion event used a one-step total.
+- Resolved: No-baseline config differences under `config/**` were shown as blocking review choices, which could ask users to confirm hundreds of safe default-keep config files.

@@ -482,6 +482,10 @@ function displayName(path: string) {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path
 }
 
+function isBlockingReviewItem(item: ReviewItem) {
+  return !(item.kind === 'same_path_config_changed' && item.path.toLowerCase().startsWith('config/'))
+}
+
 function App() {
   const initialPreferences = useMemo(() => readCachedPreferences(), [])
   const [activePage, setActivePage] = useState<ActivePage>('update')
@@ -512,10 +516,14 @@ function App() {
 
   const hasBaseline = Boolean(oldSource)
   const canCheck = Boolean(instanceDir && newSource && !busy)
+  const blockingReviewItems = useMemo(
+    () => conservativePlan?.review_items.filter(isBlockingReviewItem) ?? [],
+    [conservativePlan],
+  )
   const baselineHasWork = Boolean(plan && (plan.added.length || plan.updated.length || plan.removed.length || plan.merged.length || plan.renamed.length))
   const conservativeHasWork = Boolean(conservativePlan && (
     conservativePlan.auto_actions.length ||
-    conservativePlan.review_items.some((item) => (reviewChoices[item.id] ?? item.default_choice) !== item.default_choice)
+    blockingReviewItems.some((item) => (reviewChoices[item.id] ?? item.default_choice) !== item.default_choice)
   ))
   const canApply = Boolean(canCheck && (
     (hasBaseline && plan && !plan.conflicts.length && baselineHasWork) ||
@@ -526,11 +534,11 @@ function App() {
   const status = useMemo(() => {
     if (busy) return { label: t.working, tone: 'working' }
     if (!instanceDir || !newSource) return { label: t.missing, tone: 'muted' }
-    if (conservativePlan?.review_items.length) return { label: t.blocked, tone: 'blocked' }
+    if (blockingReviewItems.length) return { label: t.blocked, tone: 'blocked' }
     if (plan?.conflicts.length) return { label: t.blocked, tone: 'blocked' }
     if (plan || conservativePlan) return { label: conservativePlan ? t.conservativeMode : t.safe, tone: 'safe' }
     return { label: t.waiting, tone: 'muted' }
-  }, [busy, conservativePlan, instanceDir, newSource, plan, t])
+  }, [blockingReviewItems.length, busy, conservativePlan, instanceDir, newSource, plan, t])
 
   const diffFiles = useMemo<DiffFileCandidate[]>(() => {
     const candidates: DiffFileCandidate[] = []
@@ -547,7 +555,7 @@ function App() {
     }
     if (conservativePlan) {
       candidates.push(...conservativePlan.auto_actions.map((item) => ({ path: item.path, label: item.reason, tone: 'updated' as const })))
-      candidates.push(...conservativePlan.review_items.map((item) => ({ path: item.path, label: item.reason, tone: 'conflict' as const })))
+      candidates.push(...blockingReviewItems.map((item) => ({ path: item.path, label: item.reason, tone: 'conflict' as const })))
       candidates.push(...conservativePlan.protected_items.map((item) => ({ path: item.path, label: item.reason, tone: 'protected' as const })))
     }
     const seen = new Set<string>()
@@ -557,9 +565,9 @@ function App() {
       seen.add(key)
       return true
     })
-  }, [compareResult, conservativePlan, plan, t])
+  }, [blockingReviewItems, compareResult, conservativePlan, plan, t])
 
-  const reviewCount = conservativePlan?.review_items.length ?? plan?.conflicts.length ?? 0
+  const reviewCount = conservativePlan ? blockingReviewItems.length : plan?.conflicts.length ?? 0
   const protectedCount = conservativePlan?.protected_items.length ?? plan?.preserved.length ?? 0
   const automaticCount = conservativePlan?.auto_actions.length ?? (
     plan ? plan.added.length + plan.updated.length + plan.merged.length + plan.renamed.length + plan.removed.length : 0
@@ -704,8 +712,9 @@ function App() {
         setReviewChoices(Object.fromEntries(nextPlan.review_items.map((item) => [item.id, item.default_choice])))
         setPlan(null)
         setCompareResult(null)
-        setMessage(nextPlan.review_items.length ? t.conflictBody : t.safeBody)
-        recordAppLog(nextPlan.review_items.length ? 'warn' : 'info', 'Conservative update preview completed', `${nextPlan.review_items.length} review items`)
+        const blockingCount = nextPlan.review_items.filter(isBlockingReviewItem).length
+        setMessage(blockingCount ? t.conflictBody : t.safeBody)
+        recordAppLog(blockingCount ? 'warn' : 'info', 'Conservative update preview completed', `${blockingCount} blocking review items`)
       }
       setSelectedDiffFile(null)
       setDiffPreview(null)
@@ -1079,13 +1088,13 @@ function App() {
                   )}
                 </div>
 
-                {conservativePlan?.review_items.length ? (
+                {blockingReviewItems.length ? (
                   <div className="review-inline">
                     <div className="pane-head compact">
                       <h2>{t.reviewItems}</h2>
-                      <span>{conservativePlan.review_items.length}</span>
+                      <span>{blockingReviewItems.length}</span>
                     </div>
-                    {conservativePlan.review_items.map((item) => (
+                    {blockingReviewItems.map((item) => (
                       <div className="review-row" key={item.id}>
                         <button type="button" onClick={() => openDiffFile({ path: item.path, label: item.reason, tone: 'conflict' })}>
                           <span>{item.mod_name ?? displayName(item.path)}</span>
@@ -1370,7 +1379,8 @@ function OperationToast({
 }) {
   const isFailed = progress.stage === 'failed'
   const label = isFailed ? failedLabel : progress.done ? doneLabel : activeLabel
-  const hasMeasuredProgress = progress.total > 1
+  const isIndeterminate = !progress.done && progress.total <= 1
+  const progressPercent = progress.done && !isFailed ? 100 : progress.percent
 
   return (
     <section className={`operation-toast ${progress.done ? 'done' : 'active'} ${isFailed ? 'failed' : ''}`}>
@@ -1383,12 +1393,12 @@ function OperationToast({
       </div>
       <p>{progress.message}</p>
       {progress.path && <small title={progress.path}>{progress.path}</small>}
-      <div className={`operation-progress ${hasMeasuredProgress ? '' : 'indeterminate'}`}>
-        <span style={{ width: `${hasMeasuredProgress ? progress.percent : 45}%` }} />
+      <div className={`operation-progress ${isIndeterminate ? 'indeterminate' : ''}`}>
+        <span style={{ width: `${isIndeterminate ? 45 : progressPercent}%` }} />
       </div>
       <footer>
-        <span>{hasMeasuredProgress ? `${progress.percent}%` : ''}</span>
-        {hasMeasuredProgress && <span>{progress.current}/{progress.total}</span>}
+        <span>{isIndeterminate ? '' : `${progressPercent}%`}</span>
+        {!isIndeterminate && progress.total > 1 && <span>{progress.current}/{progress.total}</span>}
       </footer>
     </section>
   )

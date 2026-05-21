@@ -58,5 +58,6 @@
 - Optimized large-pack handling by scanning ZIP sources from `File` instead of reading the whole archive into memory, hashing ZIP entries through streaming reads, emitting real scan file-count progress, and including supplemental backup files in baseline progress totals.
 - Verified the current v0.1.2-beta release-candidate build chain with `npm run lint`, `npm run build`, `cargo test`, `npm run tauri:build`, and `npm run portable:release`; the portable zip SHA256 is `5a68c67a1b0171b72047246ab2eab4dbfadd9ae1df69073ee911b3875983e9a1`.
 - Simplified the portable package contents for v0.1.2-beta so the zip contains only `kairos_patch.exe`; user/developer notes stay in release notes and docs instead of the download bundle.
+- Fixed beta feedback from video review: completion toasts now stop the loading animation, and no-baseline `config/**` same-path differences default to keep without appearing as hundreds of blocking review choices.
 - Reworked the update page into a compact desktop utility layout: toolbar, inline source fields, split changes list, diff pane, row-level review choices, and a bottom status bar.
 - Verified the split-pane utility UI with `npm run lint`, `npm run build`, and a local browser smoke check at `http://127.0.0.1:5177/`.
