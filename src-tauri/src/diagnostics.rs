@@ -480,8 +480,8 @@ fn add_file_to_zip<W: Write + std::io::Seek>(
 ) -> AppResult<()> {
     zip.start_file(name, options)
         .map_err(|error| AppError::Message(error.to_string()))?;
-    let bytes = fs::read(source)?;
-    zip.write_all(&bytes)?;
+    let mut file = fs::File::open(source)?;
+    std::io::copy(&mut file, zip)?;
     Ok(())
 }
 

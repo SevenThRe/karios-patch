@@ -7,6 +7,16 @@
 - Keep the Tauri frontend capability surface smaller than the Rust command surface. The frontend does not need direct opener plugin permissions; Rust-owned commands may open/reveal only after local validation.
 - Superseded: The first progress pass used a lightweight UI-side bar. Update execution now reports real write-stage progress through Tauri events while preserving the final apply result.
 - Large-pack ZIP handling must stay file-backed and streaming-oriented. Do not reintroduce whole-archive `fs::read` for scanning or source-file lookup paths.
+- Large artifact packaging and extraction should use stream copies by default. Avoid buffering full portable archives or user-selected diagnostic attachments in memory when a reader/writer path is available.
+- Patch source reads should be the existence check. Do not add a separate `source_file_exists` pass before `read_source_file`, because ZIP and normalized directory sources would pay the lookup cost twice.
+- Repeated reads from selected ZIP sources should reuse a cache keyed by canonical path plus file length/mtime. The cache stores normalized pack paths to ZIP entry names, not file contents.
+- Directory source scans may hash files in parallel only when no progress callback is active. Tracked scans should prioritize stable progress reporting over maximum throughput.
+- Network downloads should land in a temporary file and pass hash validation before replacing the final cache/materialized file.
+- Large React file trees should use windowed rendering instead of truncating rows or rendering the entire tree into the DOM.
+- Source file transfer should use same-directory temporary files and rename-after-validation. Do not overwrite a live instance/materialized/candidate file before the copied bytes pass expected hash checks.
+- Diff and manifest preview reads must be explicitly bounded. Treat oversize previews or install manifests as unsupported for inline parsing instead of reading the entire file.
+- Config auto-merge is a bounded text operation, not a large-file merge engine. Config files over 2 MiB should fall back to manual review/conflict handling.
+- Prioritize reproducible local release builds over maximum binary optimization on this Windows environment. The release profile may use lower optimization and more codegen units when `rustc` crashes under aggressive settings.
 - Keep rollback semantics state-driven: restore backed-up files, remove files that became managed only after the selected backup, and preserve user extra files.
 - Treat `config/` switching as line-level three-way merge: preserve user-only lines by default, apply official-only line changes, and keep same-line competing edits as manual conflicts.
 - Use `windows_subsystem = "windows"` for non-debug Windows builds so normal users see only the desktop UI, not a console host.
@@ -29,3 +39,9 @@
 - Use a GitHub Issue Form template as the public feedback surface and generate a local `github-issue-body.md` companion file from the desktop app. Issue Forms are better for repository intake, while the local markdown file preserves auto-collected metadata without forcing long URL prefill payloads.
 - Keep feedback diagnostics opt-in for logs and config. The default package may include the structured report and issue body, but app log upload and config snapshot/state files require explicit user toggles.
 - The main update surface should be a split-pane desktop utility, not a designed dashboard/workbench page. Changes and diff are the core skeleton; summaries belong in the status bar and row metadata.
+- Treat launcher-visible version metadata as pack-managed only when it is a known pack metadata filename or a root JSON whose stem matches the selected source folder/ZIP name. This avoids sweeping `.minecraft` root files such as launcher profiles into pack updates.
+- When a version-isolated target pack uses a different root version JSON filename, copy the target metadata content into the current instance metadata path instead of creating the target-named JSON beside it.
+- Completed updates should leave a durable, inspectable operation record in the backup manifest. The update page should show operation history with detail and rollback controls so the user can review the actual file tree after completion.
+- The primary user flow for this release line is current instance plus a new complete downloaded target pack. Most users will not retain an old official pack, so old-baseline mode remains advanced rather than required.
+- Manifest-only install ZIPs must be materialized before update planning. Modrinth can be materialized from `modrinth.index.json` download URLs and hashes; CurseForge must use an explicit `KAIROS_CURSEFORGE_API_KEY` to resolve `projectID/fileID` through the official API.
+- Store materialized target packs under `.packdelta/materialized/<manifest-digest>/` and rescan that cache as a normal complete pack before comparing or applying updates.

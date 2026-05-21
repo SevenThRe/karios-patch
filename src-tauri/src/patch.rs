@@ -2,11 +2,12 @@ use crate::{
     backup,
     diff::{ManifestDiff, RenamedFile, UpdatedFile},
     error::{AppError, AppResult, msg},
-    hash::{sha256_bytes, sha256_file},
+    hash::sha256_file,
     instance,
     manifest::{
-        FileType, ManifestFile, Owner, PackManifest, Strategy, read_source_file, resolve_safe,
-        source_file_exists, write_manifest,
+        FileType, ManifestFile, Owner, PackManifest, SourceKind, Strategy,
+        copy_source_file_verified, is_launcher_metadata_path, read_source_file_prefix,
+        resolve_safe, source_file_sha256, write_manifest,
     },
     state,
 };
@@ -17,6 +18,7 @@ use std::{collections::BTreeSet, fs, path::Path, process::Command};
 pub struct UpdatePlan {
     pub from: String,
     pub to: String,
+    pub target_source_kind: SourceKind,
     pub added: Vec<FileAction>,
     pub removed: Vec<FileAction>,
     pub updated: Vec<FileAction>,
@@ -33,6 +35,8 @@ pub struct UpdatePlan {
 pub struct FileAction {
     pub path: String,
     pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +90,8 @@ pub struct RollbackResult {
     pub state_path: String,
 }
 
+const MAX_AUTO_MERGE_CONFIG_BYTES: usize = 2 * 1024 * 1024;
+
 pub fn build_plan(
     instance_dir: &Path,
     old_source: &Path,
@@ -98,6 +104,7 @@ pub fn build_plan(
     let mut plan = UpdatePlan {
         from: old_manifest.version.clone(),
         to: new_manifest.version.clone(),
+        target_source_kind: new_manifest.source_kind.clone(),
         added: Vec::new(),
         removed: Vec::new(),
         updated: Vec::new(),
@@ -136,6 +143,7 @@ pub fn build_plan(
                 plan.added.push(FileAction {
                     path: file.path.clone(),
                     sha256: Some(file.sha256.clone()),
+                    source_path: None,
                 });
             }
         } else if is_mergeable_config(file) {
@@ -156,6 +164,7 @@ pub fn build_plan(
                 plan.updated.push(FileAction {
                     path: new.path.clone(),
                     sha256: Some(new.sha256.clone()),
+                    source_path: None,
                 });
                 continue;
             }
@@ -168,6 +177,7 @@ pub fn build_plan(
                 plan.updated.push(FileAction {
                     path: new.path.clone(),
                     sha256: Some(new.sha256.clone()),
+                    source_path: None,
                 });
             } else {
                 plan.log_warn(format!(
@@ -185,6 +195,8 @@ pub fn build_plan(
             plan.preserved.push(new.path.clone());
         }
     }
+
+    add_launcher_metadata_update(instance_dir, old_manifest, new_manifest, &mut plan)?;
 
     for RenamedFile { old, new } in &diff.renamed {
         if is_apply_managed(old) && is_apply_managed(new) {
@@ -402,6 +414,7 @@ pub fn apply_update_with_progress(
         copy_from_source(
             new_source,
             instance_dir,
+            update.source_path.as_deref().unwrap_or(&update.path),
             &update.path,
             update.sha256.as_deref(),
         )?;
@@ -436,7 +449,13 @@ pub fn apply_update_with_progress(
         );
     }
     for add in plan.added.clone() {
-        copy_from_source(new_source, instance_dir, &add.path, add.sha256.as_deref())?;
+        copy_from_source(
+            new_source,
+            instance_dir,
+            add.source_path.as_deref().unwrap_or(&add.path),
+            &add.path,
+            add.sha256.as_deref(),
+        )?;
         plan.log_info(format!("Added: {}", add.path));
         completed_units += 1;
         report_patch_progress(
@@ -465,6 +484,7 @@ pub fn apply_update_with_progress(
             copy_from_source(
                 new_source,
                 &conflict_root,
+                &new_file.path,
                 &new_file.path,
                 Some(&new_file.sha256),
             )?;
@@ -506,6 +526,7 @@ pub fn apply_update_with_progress(
     current_state.backups = state::read_state(instance_dir)?
         .map(|state| state.backups)
         .unwrap_or_default();
+    track_mapped_actions(&mut current_state, &new_manifest, &plan);
     track_merged_configs(&mut current_state, &new_manifest, &plan);
     current_state.backups.push(state::backup_record(
         backup_id.clone(),
@@ -513,6 +534,7 @@ pub fn apply_update_with_progress(
         new_manifest.version,
     ));
     state::write_state(instance_dir, &current_state)?;
+    backup::write_operation_files(instance_dir, &backup_id, operation_files_from_plan(&plan))?;
     completed_units = total_units;
     report_patch_progress(
         &mut on_progress,
@@ -554,6 +576,72 @@ fn report_patch_progress(
             path,
         });
     }
+}
+
+fn operation_files_from_plan(plan: &UpdatePlan) -> Vec<backup::BackupOperationFile> {
+    let mut files = Vec::new();
+    files.extend(plan.added.iter().map(|action| {
+        backup::BackupOperationFile {
+            path: action.path.clone(),
+            action: "add".to_string(),
+            source_path: action
+                .source_path
+                .clone()
+                .or_else(|| Some(action.path.clone())),
+        }
+    }));
+    files.extend(plan.updated.iter().map(|action| {
+        backup::BackupOperationFile {
+            path: action.path.clone(),
+            action: "update".to_string(),
+            source_path: action
+                .source_path
+                .clone()
+                .or_else(|| Some(action.path.clone())),
+        }
+    }));
+    files.extend(
+        plan.merged
+            .iter()
+            .map(|action| backup::BackupOperationFile {
+                path: action.path.clone(),
+                action: "merge".to_string(),
+                source_path: Some(action.path.clone()),
+            }),
+    );
+    files.extend(
+        plan.removed
+            .iter()
+            .map(|action| backup::BackupOperationFile {
+                path: action.path.clone(),
+                action: "remove".to_string(),
+                source_path: None,
+            }),
+    );
+    files.extend(
+        plan.renamed
+            .iter()
+            .map(|action| backup::BackupOperationFile {
+                path: action.to.clone(),
+                action: "rename".to_string(),
+                source_path: Some(action.from.clone()),
+            }),
+    );
+    files.extend(
+        plan.conflicts
+            .iter()
+            .map(|conflict| backup::BackupOperationFile {
+                path: conflict.path.clone(),
+                action: "conflict_candidate".to_string(),
+                source_path: Some(conflict.path.clone()),
+            }),
+    );
+    files.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.action.cmp(&right.action))
+    });
+    files
 }
 
 pub fn rollback(instance_dir: &Path, backup_id: &str) -> AppResult<RollbackResult> {
@@ -620,6 +708,7 @@ fn handle_removed(
         plan.removed.push(FileAction {
             path: file.path.clone(),
             sha256: Some(file.sha256.clone()),
+            source_path: None,
         });
     } else {
         plan.log_warn(format!(
@@ -661,6 +750,7 @@ fn handle_added_config(
         plan.merged.push(FileAction {
             path: file.path.clone(),
             sha256: Some(file.sha256.clone()),
+            source_path: None,
         });
     }
     Ok(())
@@ -688,6 +778,114 @@ fn track_merged_configs(
             },
         );
     }
+}
+
+fn track_mapped_actions(
+    current_state: &mut state::InstanceState,
+    new_manifest: &PackManifest,
+    plan: &UpdatePlan,
+) {
+    for action in plan.added.iter().chain(plan.updated.iter()) {
+        let Some(source_path) = action.source_path.as_deref() else {
+            continue;
+        };
+        let Some(file) = new_manifest
+            .files
+            .iter()
+            .find(|file| file.path == source_path)
+        else {
+            continue;
+        };
+        current_state.managed_files.remove(source_path);
+        current_state.managed_files.insert(
+            action.path.clone(),
+            state::ManagedFileState {
+                sha256: file.sha256.clone(),
+                owner: file.owner.clone(),
+                version: new_manifest.version.clone(),
+            },
+        );
+    }
+}
+
+fn add_launcher_metadata_update(
+    instance_dir: &Path,
+    old_manifest: &PackManifest,
+    new_manifest: &PackManifest,
+    plan: &mut UpdatePlan,
+) -> AppResult<()> {
+    let old_file = single_launcher_metadata_file(old_manifest);
+    let new_file = single_launcher_metadata_file(new_manifest);
+    let (Some(old_file), Some(new_file)) = (old_file, new_file) else {
+        return Ok(());
+    };
+    if old_file.path == new_file.path {
+        return Ok(());
+    }
+
+    plan.added.retain(|action| action.path != new_file.path);
+    plan.removed.retain(|action| action.path != old_file.path);
+    plan.backup_candidates.retain(|path| path != &new_file.path);
+
+    let target = resolve_safe(instance_dir, &old_file.path)?;
+    if !target.exists() {
+        plan.added.push(FileAction {
+            path: old_file.path.clone(),
+            sha256: Some(new_file.sha256.clone()),
+            source_path: Some(new_file.path.clone()),
+        });
+        plan.log_info(format!(
+            "Plan launcher metadata add: {} from {}",
+            old_file.path, new_file.path
+        ));
+        return Ok(());
+    }
+
+    let current_hash = sha256_file(&target)?;
+    if current_hash == new_file.sha256 {
+        plan.mark_current(new_file);
+    } else if current_hash == old_file.sha256 {
+        plan.backup_candidates.push(old_file.path.clone());
+        plan.updated.push(FileAction {
+            path: old_file.path.clone(),
+            sha256: Some(new_file.sha256.clone()),
+            source_path: Some(new_file.path.clone()),
+        });
+        plan.log_info(format!(
+            "Plan launcher metadata update: {} from {}",
+            old_file.path, new_file.path
+        ));
+    } else {
+        plan.conflicts.push(Conflict {
+            path: old_file.path.clone(),
+            reason: "启动器版本元信息已被本地修改，保留本地文件".to_string(),
+        });
+        plan.log_warn(format!(
+            "Conflict: launcher metadata changed locally {}",
+            old_file.path
+        ));
+    }
+    Ok(())
+}
+
+fn single_launcher_metadata_file(manifest: &PackManifest) -> Option<&ManifestFile> {
+    let mut matches = manifest
+        .files
+        .iter()
+        .filter(|file| is_launcher_metadata_file(file));
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(first)
+    }
+}
+
+fn is_launcher_metadata_file(file: &ManifestFile) -> bool {
+    is_launcher_metadata_path(&file.path)
+        || (file.owner == Owner::Pack
+            && !file.path.contains('/')
+            && file.path.to_ascii_lowercase().ends_with(".json"))
 }
 
 fn write_conflict_notes(
@@ -731,6 +929,7 @@ fn handle_updated_config(
         plan.merged.push(FileAction {
             path: new.path.clone(),
             sha256: Some(new.sha256.clone()),
+            source_path: None,
         });
         return Ok(());
     }
@@ -748,6 +947,7 @@ fn handle_updated_config(
         plan.merged.push(FileAction {
             path: new.path.clone(),
             sha256: Some(new.sha256.clone()),
+            source_path: None,
         });
     } else {
         plan.log_warn(format!(
@@ -779,6 +979,7 @@ impl UpdatePlan {
         self.already_current.push(FileAction {
             path: file.path.clone(),
             sha256: Some(file.sha256.clone()),
+            source_path: None,
         });
         self.log_info(format!("Already current: {}", file.path));
     }
@@ -825,9 +1026,20 @@ fn merge_config_file(
     relative_path: &str,
     expected_sha: Option<&str>,
 ) -> AppResult<()> {
-    let new_bytes = read_source_file(new_source, relative_path)?;
+    let target = resolve_safe(instance_dir, relative_path)?;
+    if !target.exists() {
+        copy_from_source(
+            new_source,
+            instance_dir,
+            relative_path,
+            relative_path,
+            expected_sha,
+        )?;
+        return Ok(());
+    }
+
     if let Some(expected) = expected_sha {
-        let actual_sha = sha256_bytes(&new_bytes);
+        let actual_sha = source_file_sha256(new_source, relative_path)?;
         if actual_sha != expected {
             return Err(AppError::Message(format!(
                 "SHA256 校验失败: {relative_path}"
@@ -835,15 +1047,14 @@ fn merge_config_file(
         }
     }
 
-    let target = resolve_safe(instance_dir, relative_path)?;
-    if !target.exists() {
-        copy_from_source(new_source, instance_dir, relative_path, expected_sha)?;
-        return Ok(());
-    }
-
-    let old_bytes = read_source_file(old_source, relative_path)?;
-    if sha256_file(&target)? == sha256_bytes(&old_bytes) {
-        copy_from_source(new_source, instance_dir, relative_path, expected_sha)?;
+    if sha256_file(&target)? == source_file_sha256(old_source, relative_path)? {
+        copy_from_source(
+            new_source,
+            instance_dir,
+            relative_path,
+            relative_path,
+            expected_sha,
+        )?;
         return Ok(());
     }
 
@@ -861,7 +1072,12 @@ fn merge_config_file(
 }
 
 fn read_utf8(root: &Path, relative_path: &str) -> AppResult<String> {
-    let bytes = read_source_file(root, relative_path)?;
+    let bytes = read_source_file_prefix(root, relative_path, MAX_AUTO_MERGE_CONFIG_BYTES)?;
+    if bytes.len() > MAX_AUTO_MERGE_CONFIG_BYTES {
+        return Err(AppError::Message(format!(
+            "config 过大，跳过自动合并并交由手动处理: {relative_path}"
+        )));
+    }
     String::from_utf8(bytes).map_err(|_| {
         AppError::Message(format!(
             "config 不是 UTF-8 文本，无法自动合并: {relative_path}"
@@ -1061,28 +1277,12 @@ fn ranges_overlap(left: &LineChange, right: &LineChange) -> bool {
 fn copy_from_source(
     source_root: &Path,
     target_root: &Path,
-    relative_path: &str,
+    source_relative_path: &str,
+    target_relative_path: &str,
     expected_sha: Option<&str>,
 ) -> AppResult<()> {
-    if !source_file_exists(source_root, relative_path)? {
-        return Err(AppError::Message(format!(
-            "源文件不存在: {} -> {}",
-            source_root.display(),
-            relative_path
-        )));
-    }
-    let content = read_source_file(source_root, relative_path)?;
-    let actual_sha = sha256_bytes(&content);
-    if let Some(expected) = expected_sha {
-        if actual_sha != expected {
-            return Err(AppError::Message(format!(
-                "SHA256 校验失败: {relative_path}"
-            )));
-        }
-    }
-    let target = resolve_safe(target_root, relative_path)?;
-    ensure_parent(&target)?;
-    fs::write(target, content)?;
+    let target = resolve_safe(target_root, target_relative_path)?;
+    copy_source_file_verified(source_root, source_relative_path, &target, expected_sha)?;
     Ok(())
 }
 
@@ -1189,7 +1389,11 @@ mod tests {
         let temp = tempdir().unwrap();
         let old_source = temp.path().join("old");
         let new_source = temp.path().join("new");
-        let instance = temp.path().join("instance");
+        let instance = temp
+            .path()
+            .join(".minecraft")
+            .join("versions")
+            .join("Old Pack");
 
         write_file(&old_source, "mods/a.jar", b"old-a");
         write_file(&old_source, "mods/remove.jar", b"remove-me");
@@ -1396,6 +1600,47 @@ mod tests {
                 .join(".packdelta/conflicts/1.0.0_to_1.0.1/README.txt")
                 .exists()
         );
+    }
+
+    #[test]
+    fn apply_updates_launcher_metadata_when_version_json_name_changes() {
+        let temp = tempdir().unwrap();
+        let old_source = temp.path().join("Old Pack");
+        let new_source = temp.path().join("New Pack");
+        let instance = temp.path().join("instance");
+
+        write_file(&old_source, "mods/a.jar", b"same-mod");
+        write_file(&new_source, "mods/a.jar", b"same-mod");
+        write_file(&old_source, "Old Pack.json", br#"{"id":"old"}"#);
+        write_file(&new_source, "New Pack.json", br#"{"id":"new"}"#);
+        write_file(&instance, "mods/a.jar", b"same-mod");
+        write_file(&instance, "Old Pack.json", br#"{"id":"old"}"#);
+
+        let old_manifest =
+            scan_pack_source(&old_source, None, None, Some("1.0.0".to_string())).unwrap();
+        let new_manifest =
+            scan_pack_source(&new_source, None, None, Some("1.0.1".to_string())).unwrap();
+
+        let result = apply_update(
+            &instance,
+            &old_source,
+            &new_source,
+            old_manifest,
+            new_manifest,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(instance.join("Old Pack.json")).unwrap(),
+            r#"{"id":"new"}"#
+        );
+        assert!(!instance.join("New Pack.json").exists());
+        assert!(result.plan.updated.iter().any(|action| {
+            action.path == "Old Pack.json" && action.source_path.as_deref() == Some("New Pack.json")
+        }));
+        let state = state::read_state(&instance).unwrap().unwrap();
+        assert!(state.managed_files.contains_key("Old Pack.json"));
+        assert!(!state.managed_files.contains_key("New Pack.json"));
     }
 
     #[test]

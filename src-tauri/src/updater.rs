@@ -7,7 +7,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{Cursor, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -177,21 +177,30 @@ pub fn changelog(index_url: &str) -> AppResult<Vec<ChangelogRelease>> {
 
 pub fn download(release: AppRelease) -> AppResult<DownloadedUpdate> {
     let release = normalize_release(release)?;
-    let bytes = reqwest::blocking::get(&release.portable.url)?
-        .error_for_status()?
-        .bytes()?;
     let cache = update_version_cache_dir(&release.version)?;
     fs::create_dir_all(&cache)?;
     let archive_path = cache.join(PORTABLE_ARCHIVE_NAME);
-    fs::write(&archive_path, &bytes)?;
+    let temp_path = cache.join(format!("{PORTABLE_ARCHIVE_NAME}.download"));
+    let mut response = reqwest::blocking::get(&release.portable.url)?.error_for_status()?;
+    let mut output = fs::File::create(&temp_path)?;
+    if let Err(error) = std::io::copy(&mut response, &mut output) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    drop(output);
 
-    let actual_sha = sha256_file(&archive_path)?;
+    let actual_sha = sha256_file(&temp_path)?;
     if !actual_sha.eq_ignore_ascii_case(&release.portable.sha256) {
+        let _ = fs::remove_file(&temp_path);
         return Err(AppError::Message(format!(
             "portable zip SHA256 校验失败，期望 {}，实际 {}",
             release.portable.sha256, actual_sha
         )));
     }
+    if archive_path.exists() {
+        fs::remove_file(&archive_path)?;
+    }
+    fs::rename(temp_path, &archive_path)?;
 
     Ok(DownloadedUpdate {
         version: release.version,
@@ -413,9 +422,9 @@ fn is_newer(candidate: &str, current: &str) -> bool {
 }
 
 fn extract_zip(archive_path: &Path, target_dir: &Path) -> AppResult<()> {
-    let bytes = fs::read(archive_path)?;
-    let mut archive = ZipArchive::new(Cursor::new(bytes))
-        .map_err(|error| AppError::Message(error.to_string()))?;
+    let archive_file = fs::File::open(archive_path)?;
+    let mut archive =
+        ZipArchive::new(archive_file).map_err(|error| AppError::Message(error.to_string()))?;
 
     for index in 0..archive.len() {
         let mut file = archive

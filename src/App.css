@@ -682,7 +682,7 @@ button:disabled {
 
 .backup-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) max-content max-content;
+  grid-template-columns: minmax(0, 1fr) max-content max-content max-content;
   align-items: center;
   gap: 14px;
   border-bottom: 1px solid var(--line);
@@ -1216,6 +1216,16 @@ button:disabled {
   box-shadow: 0 12px 26px rgba(20, 24, 33, .12);
 }
 
+.activity-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+
 .tool-split {
   display: grid;
   grid-template-columns: minmax(280px, 34%) minmax(0, 1fr);
@@ -1277,8 +1287,104 @@ button:disabled {
 
 .change-list {
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   padding: 4px 0;
+}
+
+.tree-list {
+  padding: 0;
+}
+
+.file-tree {
+  height: 100%;
+  overflow: auto;
+  position: relative;
+  min-width: 0;
+}
+
+.file-tree-spacer {
+  position: relative;
+  min-width: 0;
+}
+
+.tree-row {
+  display: grid;
+  position: absolute;
+  left: 0;
+  right: 0;
+  grid-template-columns: 18px minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  align-items: center;
+  width: 100%;
+  min-height: 30px;
+  border-left: 2px solid transparent;
+  background: transparent;
+  padding: 4px 10px 4px calc(8px + (var(--depth) * 14px));
+  color: var(--text-soft);
+  cursor: pointer;
+  text-align: left;
+}
+
+.tree-row.folder {
+  min-height: 28px;
+  color: var(--muted);
+  cursor: default;
+  font-weight: 650;
+}
+
+.tree-row:disabled {
+  opacity: 1;
+}
+
+.tree-row:not(.folder):hover {
+  background: #f6f7f9;
+}
+
+.tree-row.active {
+  border-left-color: #4f78d7;
+  background: #eef3ff;
+}
+
+.tree-marker {
+  grid-row: 1 / span 2;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.tree-row.added .tree-marker {
+  color: var(--green);
+}
+
+.tree-row.removed .tree-marker,
+.tree-row.conflict .tree-marker {
+  color: var(--red);
+}
+
+.tree-row.protected .tree-marker {
+  color: var(--amber);
+}
+
+.tree-name,
+.tree-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.tree-row.folder .tree-name {
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.tree-row small {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .change-row {
@@ -1354,6 +1460,85 @@ button:disabled {
 
 .pane-empty small {
   color: var(--muted);
+}
+
+.history-pane {
+  display: grid;
+  grid-template-rows: auto minmax(0, .95fr) minmax(0, 1.05fr);
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--line);
+  background: #fcfcfd;
+}
+
+.history-list,
+.history-detail {
+  min-height: 0;
+  overflow: auto;
+}
+
+.history-detail {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border-top: 1px solid var(--line);
+}
+
+.history-row {
+  display: grid;
+  gap: 7px;
+  border-bottom: 1px solid var(--line-soft);
+  padding: 9px;
+}
+
+.history-row.active {
+  background: #eef3ff;
+}
+
+.history-row > button {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--text-soft);
+  cursor: pointer;
+  text-align: left;
+}
+
+.history-row strong,
+.history-row span,
+.history-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-row strong {
+  font-size: 12px;
+}
+
+.history-row span {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.history-row small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.history-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.history-actions .plain-button {
+  min-height: 28px;
+  padding: 0 8px;
+  font-size: 12px;
 }
 
 .review-inline {
@@ -1463,6 +1648,7 @@ button:disabled {
 
   .utility-toolbar,
   .utility-sources,
+  .activity-shell,
   .tool-split {
     grid-template-columns: 1fr;
   }
@@ -1475,6 +1661,12 @@ button:disabled {
 
   .diff-pane {
     min-height: 480px;
+  }
+
+  .history-pane {
+    min-height: 360px;
+    border-left: 0;
+    border-top: 1px solid var(--line);
   }
 
   .utility-actions {

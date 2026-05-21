@@ -13,6 +13,8 @@ pub struct BackupManifest {
     pub from: String,
     pub to: String,
     pub files: Vec<BackupFile>,
+    #[serde(default)]
+    pub operation_files: Vec<BackupOperationFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +22,13 @@ pub struct BackupFile {
     pub path: String,
     pub sha256: String,
     pub backup_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupOperationFile {
+    pub path: String,
+    pub action: String,
+    pub source_path: Option<String>,
 }
 
 pub fn make_backup_id(from: &str, to: &str) -> String {
@@ -54,12 +63,29 @@ pub fn create_backup(
         from: from.to_string(),
         to: to.to_string(),
         files,
+        operation_files: Vec::new(),
     };
     fs::write(
         backup_dir.join("backup-manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
     Ok(manifest)
+}
+
+pub fn write_operation_files(
+    instance_dir: &Path,
+    backup_id: &str,
+    operation_files: Vec<BackupOperationFile>,
+) -> AppResult<()> {
+    let backup_dir = instance_dir
+        .join(".packdelta")
+        .join("backups")
+        .join(backup_id);
+    let path = backup_dir.join("backup-manifest.json");
+    let mut manifest: BackupManifest = serde_json::from_slice(&fs::read(&path)?)?;
+    manifest.operation_files = operation_files;
+    fs::write(path, serde_json::to_vec_pretty(&manifest)?)?;
+    Ok(())
 }
 
 pub fn copy_into_backup(

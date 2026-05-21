@@ -25,12 +25,12 @@ KairosPatch-v0.1.2-portable.zip.sha256.json
   "releases": [
     {
       "version": "0.1.2",
-      "notes": "Portable update package.",
-      "published_at": "2026-05-21T01:59:34Z",
+      "notes": "Adds manifest-only pack materialization, safer no-baseline update execution, operation history details, bounded large-file handling, streaming copy/download paths, and virtualized large file trees.",
+      "published_at": "2026-05-21T14:45:14Z",
       "portable": {
         "url": "https://github.com/SevenThRe/karios-patch/releases/download/v0.1.2/KairosPatch-v0.1.2-portable.zip",
-        "sha256": "847d84ee9431e40ce5c2e5c26073ae8f94ef34d0206db0a2000227cd0b63cb9c",
-        "size": 3575233
+        "sha256": "285a6f3e8459b449f6dd9e02915ba783ceeaf5add5d0febbf47d23a7be56352a",
+        "size": 3720534
       }
     }
   ]

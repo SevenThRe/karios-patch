@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
 import {
   ArchiveRestore,
   Bug,
@@ -26,6 +27,7 @@ import './App.css'
 type FileAction = {
   path: string
   sha256?: string
+  source_path?: string | null
 }
 
 type RenameAction = {
@@ -58,6 +60,7 @@ type OperationProgress = {
 type UpdatePlan = {
   from: string
   to: string
+  target_source_kind: PackManifest['source_kind']
   added: FileAction[]
   removed: FileAction[]
   updated: FileAction[]
@@ -84,6 +87,7 @@ type PackManifest = {
   pack_id: string
   pack_name: string
   version: string
+  source_kind: 'complete_pack' | 'curse_forge_manifest_only' | 'modrinth_manifest_only' | 'unknown'
   created_at: string
   files: ManifestFile[]
 }
@@ -107,6 +111,16 @@ type BackupSummary = {
   from: string
   to: string
   file_count: number
+}
+
+type BackupOperationFile = {
+  path: string
+  action: string
+  source_path?: string | null
+}
+
+type BackupDetail = BackupSummary & {
+  operation_files: BackupOperationFile[]
 }
 
 type ApplyResult = {
@@ -214,6 +228,7 @@ type ProtectedItem = {
 type ConservativeUpdatePlan = {
   mode: string
   target_version: string
+  target_source_kind: PackManifest['source_kind']
   auto_actions: ConservativeAction[]
   review_items: ReviewItem[]
   protected_items: ProtectedItem[]
@@ -247,6 +262,15 @@ type DiffFileCandidate = {
   path: string
   label: string
   tone: DiffTone
+}
+
+type FileTreeEntry = {
+  key: string
+  name: string
+  path: string
+  depth: number
+  isFile: boolean
+  candidate?: DiffFileCandidate
 }
 
 type ActivePage = 'update' | 'backups' | 'settings'
@@ -318,6 +342,10 @@ const copy = {
     noDiff: '选择文件后显示内置 diff。',
     diffUnavailable: '这个文件暂时不能用文本方式预览。',
     recentBackups: '备份记录',
+    operationHistory: '操作历史',
+    operationDetails: '操作详情',
+    detail: '详细',
+    noOperationDetails: '选择一条历史操作后查看文件树。',
     noBackups: '还没有备份记录。',
     rollback: '还原',
     appUpdate: '应用更新',
@@ -412,6 +440,10 @@ const copy = {
     noDiff: 'Select a file to show the built-in diff.',
     diffUnavailable: 'This file cannot be previewed as text yet.',
     recentBackups: 'Backups',
+    operationHistory: 'Operation History',
+    operationDetails: 'Operation Details',
+    detail: 'Details',
+    noOperationDetails: 'Select a history item to inspect the file tree.',
     noBackups: 'No backup records yet.',
     rollback: 'Restore',
     appUpdate: 'App Update',
@@ -482,6 +514,58 @@ function displayName(path: string) {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path
 }
 
+function toneForHistoryAction(action: string): DiffTone {
+  if (action.includes('remove')) return 'removed'
+  if (action.includes('add')) return 'added'
+  if (action.includes('conflict')) return 'conflict'
+  if (action.includes('backup')) return 'protected'
+  return 'updated'
+}
+
+function buildFileTreeEntries(files: DiffFileCandidate[]): FileTreeEntry[] {
+  const directories = new Set<string>()
+  const byPath = new Map(files.map((file) => [file.path, file]))
+  for (const file of files) {
+    const parts = file.path.split('/').filter(Boolean)
+    for (let index = 1; index < parts.length; index += 1) {
+      directories.add(parts.slice(0, index).join('/'))
+    }
+  }
+  const paths = [...directories, ...files.map((file) => file.path)].sort((left, right) => left.localeCompare(right))
+  return paths.map((path) => {
+    const candidate = byPath.get(path)
+    const parts = path.split('/').filter(Boolean)
+    return {
+      key: `${candidate ? 'file' : 'dir'}:${path}`,
+      name: parts.at(-1) ?? path,
+      path,
+      depth: Math.max(parts.length - 1, 0),
+      isFile: Boolean(candidate),
+      candidate,
+    }
+  })
+}
+
+const TREE_ROW_HEIGHT = 34
+const TREE_OVERSCAN_ROWS = 8
+
+function isCompletePack(kind?: PackManifest['source_kind']) {
+  return kind === 'complete_pack'
+}
+
+function sourceKindWarning(kind?: PackManifest['source_kind'], locale: Locale = 'zh') {
+  if (!kind || kind === 'complete_pack') return ''
+  const names = {
+    curse_forge_manifest_only: 'CurseForge manifest-only',
+    modrinth_manifest_only: 'Modrinth manifest-only',
+    unknown: locale === 'zh' ? '未确认完整包' : 'unknown source',
+  } satisfies Record<Exclude<PackManifest['source_kind'], 'complete_pack'>, string>
+  const name = names[kind]
+  return locale === 'zh'
+    ? `已识别为 ${name}，可以检测内容，但不能直接执行更新；请先用启动器导入并下载完整 mods jar。`
+    : `Detected ${name}. Detection is available, but apply is disabled until the pack is imported and mod jars are downloaded.`
+}
+
 function isBlockingReviewItem(item: ReviewItem) {
   return !(item.kind === 'same_path_config_changed' && item.path.toLowerCase().startsWith('config/'))
 }
@@ -497,6 +581,7 @@ function App() {
   const [conservativePlan, setConservativePlan] = useState<ConservativeUpdatePlan | null>(null)
   const [compareResult, setCompareResult] = useState<CompareResult | null>(null)
   const [backups, setBackups] = useState<BackupSummary[]>([])
+  const [activeBackupDetail, setActiveBackupDetail] = useState<BackupDetail | null>(null)
   const [busy, setBusy] = useState('')
   const [message, setMessage] = useState('')
   const [lastLogs, setLastLogs] = useState<OperationLog[]>([])
@@ -526,8 +611,8 @@ function App() {
     blockingReviewItems.some((item) => (reviewChoices[item.id] ?? item.default_choice) !== item.default_choice)
   ))
   const canApply = Boolean(canCheck && (
-    (hasBaseline && plan && !plan.conflicts.length && baselineHasWork) ||
-    (!hasBaseline && conservativePlan && conservativeHasWork)
+    (hasBaseline && plan && isCompletePack(plan.target_source_kind) && !plan.conflicts.length && baselineHasWork) ||
+    (!hasBaseline && conservativePlan && isCompletePack(conservativePlan.target_source_kind) && conservativeHasWork)
   ))
   const currentPatchVersion = conservativePlan?.target_version ?? plan?.to ?? appUpdate?.latest_version ?? appVersion
 
@@ -566,6 +651,15 @@ function App() {
       return true
     })
   }, [blockingReviewItems, compareResult, conservativePlan, plan, t])
+
+  const activeBackupFiles = useMemo<DiffFileCandidate[]>(
+    () => activeBackupDetail?.operation_files.map((file) => ({
+      path: file.path,
+      label: file.source_path && file.source_path !== file.path ? `${file.action}: ${file.source_path}` : file.action,
+      tone: toneForHistoryAction(file.action),
+    })) ?? [],
+    [activeBackupDetail],
+  )
 
   const reviewCount = conservativePlan ? blockingReviewItems.length : plan?.conflicts.length ?? 0
   const protectedCount = conservativePlan?.protected_items.length ?? plan?.preserved.length ?? 0
@@ -701,7 +795,7 @@ function App() {
         setCompareResult(compare)
         setPlan(nextPlan)
         setConservativePlan(null)
-        setMessage(nextPlan.conflicts.length ? t.conflictBody : t.safeBody)
+        setMessage(sourceKindWarning(nextPlan.target_source_kind, locale) || (nextPlan.conflicts.length ? t.conflictBody : t.safeBody))
         recordAppLog(nextPlan.conflicts.length ? 'warn' : 'info', 'Baseline update preview completed', `${nextPlan.conflicts.length} conflicts`)
       } else {
         const nextPlan = await invoke<ConservativeUpdatePlan>('preview_conservative_update', {
@@ -713,7 +807,7 @@ function App() {
         setPlan(null)
         setCompareResult(null)
         const blockingCount = nextPlan.review_items.filter(isBlockingReviewItem).length
-        setMessage(blockingCount ? t.conflictBody : t.safeBody)
+        setMessage(sourceKindWarning(nextPlan.target_source_kind, locale) || (blockingCount ? t.conflictBody : t.safeBody))
         recordAppLog(blockingCount ? 'warn' : 'info', 'Conservative update preview completed', `${blockingCount} blocking review items`)
       }
       setSelectedDiffFile(null)
@@ -748,6 +842,7 @@ function App() {
         const result = await invoke<ApplyResult>('apply_update_tracked', { operationId, instanceDir, oldSource, newSource })
         setLastLogs(result.logs)
         setPlan(result.plan)
+        if (result.backup_id) await loadBackupDetail(result.backup_id, true)
         setMessage(result.backup_id ? `${locale === 'zh' ? '更新完成，备份 ID' : 'Update complete. Backup ID'}: ${result.backup_id}` : locale === 'zh' ? '无需写入，已经是目标版本。' : 'No writes needed. Already at target version.')
         recordAppLog('info', 'Baseline update apply completed', result.backup_id ?? 'no backup')
       } else {
@@ -764,6 +859,7 @@ function App() {
         })
         setConservativePlan(nextPlan)
         setReviewChoices(Object.fromEntries(nextPlan.review_items.map((item) => [item.id, item.default_choice])))
+        if (result.backup_id) await loadBackupDetail(result.backup_id, true)
         setMessage(result.backup_id ? `${locale === 'zh' ? '更新完成，备份 ID' : 'Update complete. Backup ID'}: ${result.backup_id}` : locale === 'zh' ? '无需写入。' : 'No writes needed.')
         recordAppLog('info', 'Conservative update apply completed', result.backup_id ?? 'no backup')
       }
@@ -796,6 +892,20 @@ function App() {
       if (!silent) setMessage(result.length ? `${result.length} ${t.backups}` : t.noBackups)
     } catch (error) {
       if (!silent) setMessage(String(error))
+    } finally {
+      if (!silent) setBusy('')
+    }
+  }
+
+  async function loadBackupDetail(backupId: string, silent = false) {
+    if (!instanceDir) return
+    if (!silent) setBusy(`detail:${backupId}`)
+    try {
+      const detail = await invoke<BackupDetail>('get_backup_detail', { instanceDir, backupId })
+      setActiveBackupDetail(detail)
+      if (!silent) setMessage(`${t.operationDetails}: ${backupId}`)
+    } catch (error) {
+      setMessage(String(error))
     } finally {
       if (!silent) setBusy('')
     }
@@ -1062,25 +1172,21 @@ function App() {
               </details>
             </section>
 
+            <section className="activity-shell">
             <section className="tool-split">
               <aside className="changes-pane">
                 <div className="pane-head">
                   <h2>{t.changedFiles}</h2>
                   <span>{diffFiles.length}</span>
                 </div>
-                <div className="change-list">
-                  {diffFiles.length ? diffFiles.slice(0, 140).map((file) => (
-                    <button
-                      type="button"
-                      className={`change-row ${file.tone} ${selectedDiffFile?.path === file.path ? 'active' : ''}`}
-                      key={`${file.tone}:${file.path}`}
-                      onClick={() => openDiffFile(file)}
-                    >
-                      <span className="change-kind">{file.tone === 'added' ? '+' : file.tone === 'removed' ? '-' : file.tone === 'conflict' ? '!' : file.tone === 'protected' ? '=' : '~'}</span>
-                      <span className="change-path">{file.path}</span>
-                      <small>{file.label}</small>
-                    </button>
-                  )) : (
+                <div className="change-list tree-list">
+                  {diffFiles.length ? (
+                    <FileTree
+                      files={diffFiles}
+                      selectedPath={selectedDiffFile?.path}
+                      onSelect={openDiffFile}
+                    />
+                  ) : (
                     <div className="pane-empty">
                       <span>{t.noPlan}</span>
                       <small>{message || t.emptyPlanBody}</small>
@@ -1156,6 +1262,43 @@ function App() {
               </section>
             </section>
 
+            <aside className="history-pane">
+              <div className="pane-head">
+                <h2>{t.operationHistory}</h2>
+                <span>{backups.length}</span>
+              </div>
+              <div className="history-list">
+                {backups.length ? backups.slice(0, 12).map((backup) => (
+                  <article className={`history-row ${activeBackupDetail?.id === backup.id ? 'active' : ''}`} key={backup.id}>
+                    <button type="button" onClick={() => loadBackupDetail(backup.id)} disabled={Boolean(busy)}>
+                      <strong>{backup.from} {'->'} {backup.to}</strong>
+                      <span>{backup.id}</span>
+                    </button>
+                    <small>{backup.file_count} {t.files}</small>
+                    <div className="history-actions">
+                      <button type="button" className="plain-button" onClick={() => loadBackupDetail(backup.id)} disabled={Boolean(busy)}>{t.detail}</button>
+                      <button type="button" className="plain-button" onClick={() => rollback(backup.id)} disabled={Boolean(busy)}>{t.rollback}</button>
+                    </div>
+                  </article>
+                )) : <p className="quiet">{t.noBackups}</p>}
+              </div>
+
+              <div className="history-detail">
+                <div className="pane-head compact">
+                  <h2>{t.operationDetails}</h2>
+                  <span>{activeBackupFiles.length}</span>
+                </div>
+                {activeBackupFiles.length ? (
+                  <FileTree files={activeBackupFiles} selectedPath="" />
+                ) : (
+                  <div className="pane-empty">
+                    <span>{t.noOperationDetails}</span>
+                  </div>
+                )}
+              </div>
+            </aside>
+            </section>
+
             <footer className="utility-statusbar">
               <span>{message || ((plan || conservativePlan) ? ((reviewCount > 0) ? t.conflictBody : t.safeBody) : t.emptyPlanBody)}</span>
               <span>{automaticCount} {t.autoActions}</span>
@@ -1191,6 +1334,9 @@ function App() {
                     <span>{backup.id}</span>
                   </div>
                   <small>{backup.file_count} {t.files}</small>
+                  <button type="button" className="plain-button" onClick={() => loadBackupDetail(backup.id)} disabled={Boolean(busy)}>
+                    {t.detail}
+                  </button>
                   <button type="button" className="plain-button" onClick={() => rollback(backup.id)} disabled={Boolean(busy)}>
                     {t.rollback}
                   </button>
@@ -1401,6 +1547,78 @@ function OperationToast({
         {!isIndeterminate && progress.total > 1 && <span>{progress.current}/{progress.total}</span>}
       </footer>
     </section>
+  )
+}
+
+function FileTree({
+  files,
+  selectedPath,
+  onSelect,
+}: {
+  files: DiffFileCandidate[]
+  selectedPath?: string
+  onSelect?: (file: DiffFileCandidate) => void
+}) {
+  const viewportRef = useRef<HTMLDivElement | null>(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewportHeight, setViewportHeight] = useState(0)
+  const entries = useMemo(() => buildFileTreeEntries(files), [files])
+  const totalHeight = entries.length * TREE_ROW_HEIGHT
+  const effectiveViewportHeight = viewportHeight || 360
+  const startIndex = Math.max(0, Math.floor(scrollTop / TREE_ROW_HEIGHT) - TREE_OVERSCAN_ROWS)
+  const visibleCount = Math.ceil(effectiveViewportHeight / TREE_ROW_HEIGHT) + TREE_OVERSCAN_ROWS * 2
+  const visibleEntries = entries.slice(startIndex, startIndex + visibleCount)
+
+  useEffect(() => {
+    const element = viewportRef.current
+    if (!element) return undefined
+    const updateHeight = () => setViewportHeight(element.clientHeight)
+    updateHeight()
+    const observer = new ResizeObserver(updateHeight)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
+
+  return (
+    <div
+      className="file-tree"
+      role="tree"
+      ref={viewportRef}
+      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+    >
+      <div className="file-tree-spacer" style={{ height: totalHeight }}>
+      {visibleEntries.map((entry, offset) => {
+        const rowIndex = startIndex + offset
+        const marker = entry.isFile
+          ? entry.candidate?.tone === 'added' ? '+'
+            : entry.candidate?.tone === 'removed' ? '-'
+              : entry.candidate?.tone === 'conflict' ? '!'
+                : entry.candidate?.tone === 'protected' ? '='
+                  : '~'
+          : ''
+        return (
+          <button
+            type="button"
+            role="treeitem"
+            key={entry.key}
+            className={`tree-row ${entry.isFile ? entry.candidate?.tone ?? 'updated' : 'folder'} ${selectedPath === entry.path ? 'active' : ''}`}
+            style={{
+              '--depth': entry.depth,
+              height: TREE_ROW_HEIGHT,
+              top: rowIndex * TREE_ROW_HEIGHT,
+            } as CSSProperties & Record<'--depth', number>}
+            disabled={!entry.isFile || !onSelect}
+            onClick={() => entry.candidate && onSelect?.(entry.candidate)}
+            title={entry.path}
+          >
+            <span className="tree-marker">{entry.isFile ? marker : '>'}</span>
+            <span className="tree-name">{entry.name}</span>
+            {entry.candidate && <small>{entry.candidate.label}</small>}
+          </button>
+        )
+      })}
+      </div>
+    </div>
   )
 }
 

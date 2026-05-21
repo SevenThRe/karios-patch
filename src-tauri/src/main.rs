@@ -28,6 +28,7 @@ fn main() {
             commands::apply_update,
             commands::apply_update_tracked,
             commands::list_backups,
+            commands::get_backup_detail,
             commands::rollback,
             commands::open_folder,
             commands::load_app_preferences,

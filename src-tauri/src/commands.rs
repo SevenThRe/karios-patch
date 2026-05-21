@@ -3,13 +3,13 @@ use crate::{
     diagnostics::{self, AppLogRequest, FeedbackPackage, FeedbackRequest},
     diff::{self, ManifestDiff},
     error::{AppError, AppResult},
-    hash::{sha256_bytes, sha256_file},
+    hash::{sha1_file, sha256_file, sha512_file},
     instance,
     manifest::{
-        FileType, ManifestFile, ManifestScanProgress, Owner, PackManifest, read_source_file,
+        FileType, ManifestFile, ManifestScanProgress, Owner, PackManifest, SourceKind,
+        copy_source_file_verified, is_launcher_metadata_path, read_source_file_prefix,
         resolve_safe, scan_pack_source as scan_source,
-        scan_pack_source_with_progress as scan_source_with_progress, source_file_exists,
-        write_manifest,
+        scan_pack_source_with_progress as scan_source_with_progress, write_manifest,
     },
     patch::{self, ApplyResult, RollbackResult, UpdatePlan},
     preferences::{self, AppPreferences},
@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{Cursor, Read},
+    io::{Read, Seek},
     path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter};
 use zip::ZipArchive;
@@ -52,6 +53,22 @@ pub struct BackupSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupDetail {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub file_count: usize,
+    pub operation_files: Vec<BackupOperationFileView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupOperationFileView {
+    pub path: String,
+    pub action: String,
+    pub source_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceDiffPreview {
     pub path: String,
     pub old_text: String,
@@ -64,6 +81,7 @@ pub struct SourceDiffPreview {
 pub struct ConservativeUpdatePlan {
     pub mode: String,
     pub target_version: String,
+    pub target_source_kind: SourceKind,
     pub auto_actions: Vec<ConservativeAction>,
     pub review_items: Vec<ReviewItem>,
     pub protected_items: Vec<ProtectedItem>,
@@ -152,6 +170,70 @@ struct ModInfo {
     version: Option<String>,
 }
 
+struct PreparedSource {
+    path: PathBuf,
+    manifest: PackManifest,
+    logs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModrinthIndex {
+    files: Vec<ModrinthFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModrinthFile {
+    path: String,
+    hashes: BTreeMap<String, String>,
+    downloads: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurseForgeManifest {
+    files: Vec<CurseForgeManifestFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeManifestFile {
+    project_id: u64,
+    file_id: u64,
+    #[serde(default = "default_required")]
+    required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurseForgeFileResponse {
+    data: CurseForgeFileData,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurseForgeFileData {
+    file_name: String,
+    download_url: Option<String>,
+    hashes: Vec<CurseForgeHash>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurseForgeHash {
+    value: String,
+    algo: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExpectedDownloadHash<'a> {
+    Sha512(&'a str),
+    Sha1(&'a str),
+    None,
+}
+
+fn default_required() -> bool {
+    true
+}
+
+const MAX_INSTALL_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+
 #[tauri::command]
 pub fn scan_pack_source(path: String, options: Option<ScanOptions>) -> AppResult<PackManifest> {
     let options = options.unwrap_or(ScanOptions {
@@ -197,8 +279,8 @@ pub fn read_source_diff(
 ) -> AppResult<SourceDiffPreview> {
     const MAX_PREVIEW_BYTES: usize = 512 * 1024;
 
-    let old_bytes = read_source_file(Path::new(&old_source), &path).ok();
-    let new_bytes = read_source_file(Path::new(&new_source), &path).ok();
+    let old_bytes = read_source_file_prefix(Path::new(&old_source), &path, MAX_PREVIEW_BYTES).ok();
+    let new_bytes = read_source_file_prefix(Path::new(&new_source), &path, MAX_PREVIEW_BYTES).ok();
     let language = language_from_path(&path);
 
     let old_text = preview_text(old_bytes.as_deref(), MAX_PREVIEW_BYTES);
@@ -255,19 +337,49 @@ fn preview_conservative_update_with_progress(
         Some("target-local".to_string()),
         Some(&mut emit_target_scan),
     )?;
+    let prepared_target = prepare_target_source(
+        Path::new(&instance_dir),
+        Path::new(&target_source),
+        target,
+        Some(&mut |message| {
+            if let Some(callback) = on_progress.as_deref_mut() {
+                callback(
+                    "Preparing target source",
+                    ManifestScanProgress {
+                        source: target_source.clone(),
+                        current: 0,
+                        total: 1,
+                        path: Some(message),
+                    },
+                );
+            }
+        }),
+    )?;
+    let target_source_path = prepared_target.path;
+    let target = prepared_target.manifest;
     let instance_by_path = by_path(&instance.files);
     let target_by_path = by_path(&target.files);
     let instance_mods = mod_index(Path::new(&instance_dir), &instance.files);
-    let target_mods = mod_index(Path::new(&target_source), &target.files);
+    let target_mods = mod_index(&target_source_path, &target.files);
+    let instance_metadata = single_launcher_metadata_file(&instance.files);
+    let target_metadata = single_launcher_metadata_file(&target.files);
     let mut auto_actions = Vec::new();
     let mut review_items = Vec::new();
     let mut protected_items = Vec::new();
     let mut logs = vec![
         "No historical baseline was provided. Conservative mode will not delete unknown local files automatically.".to_string(),
     ];
+    logs.extend(prepared_target.logs);
 
     for target_file in &target.files {
         let Some(local_file) = instance_by_path.get(&target_file.path) else {
+            if is_launcher_metadata_file(target_file)
+                && instance_metadata.is_some()
+                && instance_metadata.map(|file| file.path.as_str())
+                    != Some(target_file.path.as_str())
+            {
+                continue;
+            }
             if is_user_asset(target_file) {
                 protected_items.push(ProtectedItem {
                     path: target_file.path.clone(),
@@ -293,7 +405,17 @@ fn preview_conservative_update_with_progress(
             continue;
         }
 
-        if target_file.file_type == FileType::Mod {
+        if is_launcher_metadata_file(target_file) {
+            auto_actions.push(ConservativeAction {
+                path: local_file.path.clone(),
+                target_path: Some(target_file.path.clone()),
+                action: "replace_version_metadata".to_string(),
+                reason: "更新启动器版本元信息".to_string(),
+                mod_name: None,
+                from_version: None,
+                to_version: None,
+            });
+        } else if target_file.file_type == FileType::Mod {
             let local_mod = instance_mods.get(&local_file.path);
             let target_mod = target_mods.get(&target_file.path);
             if same_mod(local_mod, target_mod) {
@@ -350,7 +472,29 @@ fn preview_conservative_update_with_progress(
             continue;
         }
 
-        if local_file.file_type == FileType::Mod {
+        if is_launcher_metadata_file(local_file) {
+            if let Some(target_file) = target_metadata {
+                auto_actions.push(ConservativeAction {
+                    path: local_file.path.clone(),
+                    target_path: Some(target_file.path.clone()),
+                    action: "replace_version_metadata".to_string(),
+                    reason: format!("目标包启动器元信息为 {}", target_file.path),
+                    mod_name: None,
+                    from_version: None,
+                    to_version: None,
+                });
+            } else {
+                review_items.push(review_item(
+                    &local_file.path,
+                    "local_only_file",
+                    "目标包未包含此启动器元信息；无历史基线时需要确认",
+                    "keep",
+                    vec!["keep", "remove"],
+                    None,
+                    None,
+                ));
+            }
+        } else if local_file.file_type == FileType::Mod {
             let local_mod = instance_mods.get(&local_file.path);
             if let Some((target_path, target_mod)) = find_same_mod_target(local_mod, &target_mods) {
                 auto_actions.push(ConservativeAction {
@@ -401,6 +545,7 @@ fn preview_conservative_update_with_progress(
     Ok(ConservativeUpdatePlan {
         mode: "conservative".to_string(),
         target_version: target.version,
+        target_source_kind: target.source_kind,
         auto_actions,
         review_items,
         protected_items,
@@ -426,11 +571,19 @@ pub fn preview_update(
         None,
         Some("new-local".to_string()),
     )?;
+    let prepared_new = prepare_target_source(
+        Path::new(&instance_dir),
+        Path::new(&new_source),
+        new_manifest,
+        None,
+    )?;
+    let new_source_path = prepared_new.path;
+    let new_manifest = prepared_new.manifest;
     let diff = diff::compare(&old_manifest, &new_manifest);
     patch::build_plan(
         Path::new(&instance_dir),
         Path::new(&old_source),
-        Path::new(&new_source),
+        &new_source_path,
         &old_manifest,
         &new_manifest,
         &diff,
@@ -455,12 +608,18 @@ pub fn apply_update(
         None,
         Some("new-local".to_string()),
     )?;
+    let prepared_new = prepare_target_source(
+        Path::new(&instance_dir),
+        Path::new(&new_source),
+        new_manifest,
+        None,
+    )?;
     patch::apply_update(
         Path::new(&instance_dir),
         Path::new(&old_source),
-        Path::new(&new_source),
+        &prepared_new.path,
         old_manifest,
-        new_manifest,
+        prepared_new.manifest,
     )
 }
 
@@ -492,6 +651,7 @@ pub fn apply_update_tracked(
         Some("old-local".to_string()),
         Some(&mut emit_old_scan),
     )?;
+    validate_baseline_source_kind(&old_manifest)?;
     let mut emit_new_scan = |progress: ManifestScanProgress| {
         emit_manifest_progress(&app, &operation_id, "Scanning target source", progress);
     };
@@ -501,6 +661,23 @@ pub fn apply_update_tracked(
         None,
         Some("new-local".to_string()),
         Some(&mut emit_new_scan),
+    )?;
+    let prepared_new = prepare_target_source(
+        Path::new(&instance_dir),
+        Path::new(&new_source),
+        new_manifest,
+        Some(&mut |message| {
+            emit_operation_progress(
+                &app,
+                &operation_id,
+                "preparing",
+                &message,
+                0,
+                1,
+                None,
+                false,
+            );
+        }),
     )?;
     let mut emit_patch_progress = |progress: patch::PatchProgress| {
         emit_operation_progress(
@@ -517,9 +694,9 @@ pub fn apply_update_tracked(
     let result = patch::apply_update_with_progress(
         Path::new(&instance_dir),
         Path::new(&old_source),
-        Path::new(&new_source),
+        &prepared_new.path,
         old_manifest,
-        new_manifest,
+        prepared_new.manifest,
         Some(&mut emit_patch_progress),
     )?;
     emit_operation_progress(
@@ -643,6 +820,16 @@ fn apply_conservative_update_inner(
         Some("target-local".to_string()),
         Some(&mut emit_target_rescan),
     )?;
+    let prepared_target = prepare_target_source(
+        instance_dir,
+        target_source,
+        target,
+        Some(&mut |message| {
+            report_conservative_progress(&mut on_progress, "preparing", message, 0, 1, None);
+        }),
+    )?;
+    let target_source = prepared_target.path.as_path();
+    let target = prepared_target.manifest;
     let target_by_path = by_path(&target.files);
     let choices = normalize_review_choices(review_choices)?;
     validate_conservative_choices(&choices, &plan)?;
@@ -834,6 +1021,18 @@ fn apply_conservative_update_inner(
             backup_files,
             &state_before,
         )?;
+        backup::write_operation_files(
+            instance_dir,
+            &backup_id,
+            applied_changes
+                .iter()
+                .map(|change| backup::BackupOperationFile {
+                    path: change.path.clone(),
+                    action: change.action.clone(),
+                    source_path: change.source_path.clone(),
+                })
+                .collect(),
+        )?;
         logs.push(format!("Created backup: {}", backup_id));
     }
 
@@ -896,6 +1095,354 @@ fn report_conservative_progress(
 ) {
     if let Some(callback) = on_progress.as_deref_mut() {
         callback(stage, message, current, total, path);
+    }
+}
+
+fn validate_baseline_source_kind(manifest: &PackManifest) -> AppResult<()> {
+    if manifest.source_kind == SourceKind::CompletePack {
+        return Ok(());
+    }
+    Err(AppError::Message(
+        "当前基线包必须是已下载完整 mods jar 的旧整合包。manifest-only 索引包不能作为安全删除/合并的旧基线。".to_string(),
+    ))
+}
+
+fn prepare_target_source(
+    instance_dir: &Path,
+    target_source: &Path,
+    manifest: PackManifest,
+    mut on_progress: Option<&mut dyn FnMut(String)>,
+) -> AppResult<PreparedSource> {
+    match manifest.source_kind {
+        SourceKind::CompletePack => Ok(PreparedSource {
+            path: target_source.to_path_buf(),
+            manifest,
+            logs: Vec::new(),
+        }),
+        SourceKind::ModrinthManifestOnly => {
+            materialize_modrinth_source(instance_dir, target_source, manifest, &mut on_progress)
+        }
+        SourceKind::CurseForgeManifestOnly => {
+            materialize_curseforge_source(instance_dir, target_source, manifest, &mut on_progress)
+        }
+        SourceKind::Unknown => Err(AppError::Message(
+            "无法确认目标源是 Minecraft 整合包：未发现 mods/*.jar，也未能识别为 CurseForge/Modrinth 安装包。".to_string(),
+        )),
+    }
+}
+
+fn materialize_modrinth_source(
+    instance_dir: &Path,
+    target_source: &Path,
+    manifest: PackManifest,
+    on_progress: &mut Option<&mut dyn FnMut(String)>,
+) -> AppResult<PreparedSource> {
+    report_prepare_progress(on_progress, "Parsing Modrinth index".to_string());
+    let index: ModrinthIndex = serde_json::from_slice(&read_install_manifest(
+        target_source,
+        "modrinth.index.json",
+    )?)?;
+    let root = materialized_root(instance_dir, &manifest)?;
+    if let Some(cached) = read_cached_materialized(&root, &manifest)? {
+        return Ok(cached);
+    }
+    reset_materialized_root(&root)?;
+    copy_manifest_payload_files(target_source, &root, &manifest)?;
+    let client = download_client()?;
+    for (index_no, file) in index.files.iter().enumerate() {
+        report_prepare_progress(
+            on_progress,
+            format!(
+                "Downloading Modrinth dependency {}/{}: {}",
+                index_no + 1,
+                index.files.len(),
+                file.path
+            ),
+        );
+        let url = file.downloads.first().ok_or_else(|| {
+            AppError::Message(format!("Modrinth file has no download URL: {}", file.path))
+        })?;
+        download_to_materialized_file(
+            &client,
+            url,
+            &root,
+            &file.path,
+            modrinth_expected_hash(file)?,
+            &file.path,
+        )?;
+    }
+    let prepared_manifest = scan_source(
+        &root,
+        Some(manifest.pack_id.clone()),
+        Some(manifest.pack_name.clone()),
+        Some(manifest.version.clone()),
+    )?;
+    if prepared_manifest.source_kind != SourceKind::CompletePack {
+        return Err(AppError::Message(
+            "Modrinth 安装包已解析，但下载后仍未形成完整 mods/*.jar 目标包".to_string(),
+        ));
+    }
+    Ok(PreparedSource {
+        path: root,
+        manifest: prepared_manifest,
+        logs: vec!["Materialized Modrinth manifest-only pack into the local cache.".to_string()],
+    })
+}
+
+fn materialize_curseforge_source(
+    instance_dir: &Path,
+    target_source: &Path,
+    manifest: PackManifest,
+    on_progress: &mut Option<&mut dyn FnMut(String)>,
+) -> AppResult<PreparedSource> {
+    let api_key = std::env::var("KAIROS_CURSEFORGE_API_KEY")
+        .map_err(|_| AppError::Message(
+            "目标整合包是 CurseForge 安装 ZIP。需要设置 KAIROS_CURSEFORGE_API_KEY 后才能根据 projectID/fileID 下载 mod jar。".to_string(),
+        ))?;
+    report_prepare_progress(on_progress, "Parsing CurseForge manifest".to_string());
+    let curseforge: CurseForgeManifest =
+        serde_json::from_slice(&read_install_manifest(target_source, "manifest.json")?)?;
+    let root = materialized_root(instance_dir, &manifest)?;
+    if let Some(cached) = read_cached_materialized(&root, &manifest)? {
+        return Ok(cached);
+    }
+    reset_materialized_root(&root)?;
+    copy_manifest_payload_files(target_source, &root, &manifest)?;
+    let client = download_client()?;
+    let required_files = curseforge
+        .files
+        .iter()
+        .filter(|file| file.required)
+        .collect::<Vec<_>>();
+    for (index_no, file) in required_files.iter().enumerate() {
+        report_prepare_progress(
+            on_progress,
+            format!(
+                "Resolving CurseForge dependency {}/{}: {}/{}",
+                index_no + 1,
+                required_files.len(),
+                file.project_id,
+                file.file_id
+            ),
+        );
+        let metadata = fetch_curseforge_file(&client, &api_key, file.project_id, file.file_id)?;
+        let url = metadata.download_url.as_deref().ok_or_else(|| {
+            AppError::Message(format!(
+                "CurseForge file {}/{} does not expose a download URL. Import it with a launcher first or choose a downloaded complete pack.",
+                file.project_id, file.file_id
+            ))
+        })?;
+        let relative_path = format!("mods/{}", sanitize_path_component(&metadata.file_name));
+        download_to_materialized_file(
+            &client,
+            url,
+            &root,
+            &relative_path,
+            curseforge_expected_hash(&metadata),
+            &metadata.file_name,
+        )?;
+    }
+    let prepared_manifest = scan_source(
+        &root,
+        Some(manifest.pack_id.clone()),
+        Some(manifest.pack_name.clone()),
+        Some(manifest.version.clone()),
+    )?;
+    if prepared_manifest.source_kind != SourceKind::CompletePack {
+        return Err(AppError::Message(
+            "CurseForge 安装包已解析，但下载后仍未形成完整 mods/*.jar 目标包".to_string(),
+        ));
+    }
+    Ok(PreparedSource {
+        path: root,
+        manifest: prepared_manifest,
+        logs: vec!["Materialized CurseForge manifest-only pack into the local cache.".to_string()],
+    })
+}
+
+fn materialized_root(instance_dir: &Path, manifest: &PackManifest) -> AppResult<PathBuf> {
+    Ok(instance_dir
+        .join(".packdelta")
+        .join("materialized")
+        .join(manifest_digest(manifest)?))
+}
+
+fn read_cached_materialized(
+    root: &Path,
+    source_manifest: &PackManifest,
+) -> AppResult<Option<PreparedSource>> {
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let manifest = scan_source(
+        root,
+        Some(source_manifest.pack_id.clone()),
+        Some(source_manifest.pack_name.clone()),
+        Some(source_manifest.version.clone()),
+    )?;
+    if manifest.source_kind != SourceKind::CompletePack {
+        return Ok(None);
+    }
+    Ok(Some(PreparedSource {
+        path: root.to_path_buf(),
+        manifest,
+        logs: vec!["Using cached materialized target pack.".to_string()],
+    }))
+}
+
+fn reset_materialized_root(root: &Path) -> AppResult<()> {
+    if root.exists() {
+        fs::remove_dir_all(root)?;
+    }
+    fs::create_dir_all(root)?;
+    Ok(())
+}
+
+fn copy_manifest_payload_files(
+    source: &Path,
+    destination: &Path,
+    manifest: &PackManifest,
+) -> AppResult<()> {
+    for file in &manifest.files {
+        if matches!(file.path.as_str(), "manifest.json" | "modrinth.index.json") {
+            continue;
+        }
+        if file.file_type == FileType::Mod {
+            continue;
+        }
+        let destination_path = resolve_safe(destination, &file.path)?;
+        copy_source_file_verified(source, &file.path, &destination_path, Some(&file.sha256))?;
+    }
+    Ok(())
+}
+
+fn read_install_manifest(source: &Path, relative_path: &str) -> AppResult<Vec<u8>> {
+    let bytes = read_source_file_prefix(source, relative_path, MAX_INSTALL_MANIFEST_BYTES)?;
+    if bytes.len() > MAX_INSTALL_MANIFEST_BYTES {
+        return Err(AppError::Message(format!(
+            "Install manifest is too large: {relative_path}"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn download_client() -> AppResult<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .user_agent("KairosPatch/0.1.2")
+        .build()?)
+}
+
+fn download_to_materialized_file(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    root: &Path,
+    relative_path: &str,
+    expected_hash: ExpectedDownloadHash<'_>,
+    label: &str,
+) -> AppResult<()> {
+    let destination = resolve_safe(root, relative_path)?;
+    ensure_parent(&destination)?;
+
+    #[cfg(test)]
+    if let Some(content) = url.strip_prefix("kairos-test://") {
+        fs::write(&destination, content.as_bytes())?;
+        verify_downloaded_file_hash(&destination, expected_hash, label)?;
+        return Ok(());
+    }
+
+    let mut response = client.get(url).send()?.error_for_status()?;
+    let temp_path = download_temp_path(&destination)?;
+    let mut output = fs::File::create(&temp_path)?;
+    if let Err(error) = std::io::copy(&mut response, &mut output) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    drop(output);
+
+    if let Err(error) = verify_downloaded_file_hash(&temp_path, expected_hash, label) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    if destination.exists() {
+        fs::remove_file(&destination)?;
+    }
+    fs::rename(temp_path, destination)?;
+    Ok(())
+}
+
+fn modrinth_expected_hash(file: &ModrinthFile) -> AppResult<ExpectedDownloadHash<'_>> {
+    if let Some(expected) = file.hashes.get("sha512") {
+        return Ok(ExpectedDownloadHash::Sha512(expected));
+    }
+    if let Some(expected) = file.hashes.get("sha1") {
+        return Ok(ExpectedDownloadHash::Sha1(expected));
+    }
+    Err(AppError::Message(format!(
+        "Modrinth file has no supported hash: {}",
+        file.path
+    )))
+}
+
+fn curseforge_expected_hash(metadata: &CurseForgeFileData) -> ExpectedDownloadHash<'_> {
+    metadata
+        .hashes
+        .iter()
+        .find(|hash| hash.algo == 1)
+        .map(|hash| ExpectedDownloadHash::Sha1(hash.value.as_str()))
+        .unwrap_or(ExpectedDownloadHash::None)
+}
+
+fn verify_downloaded_file_hash(
+    path: &Path,
+    expected_hash: ExpectedDownloadHash<'_>,
+    label: &str,
+) -> AppResult<()> {
+    match expected_hash {
+        ExpectedDownloadHash::Sha512(expected) => {
+            let actual = sha512_file(path)?;
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(AppError::Message(format!("SHA512 check failed: {label}")));
+            }
+        }
+        ExpectedDownloadHash::Sha1(expected) => {
+            let actual = sha1_file(path)?;
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(AppError::Message(format!("SHA1 check failed: {label}")));
+            }
+        }
+        ExpectedDownloadHash::None => {}
+    }
+    Ok(())
+}
+
+fn download_temp_path(destination: &Path) -> AppResult<PathBuf> {
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| AppError::UnsafePath(destination.display().to_string()))?;
+    Ok(destination.with_file_name(format!("{file_name}.download")))
+}
+
+fn fetch_curseforge_file(
+    client: &reqwest::blocking::Client,
+    api_key: &str,
+    project_id: u64,
+    file_id: u64,
+) -> AppResult<CurseForgeFileData> {
+    let response = client
+        .get(format!(
+            "https://api.curseforge.com/v1/mods/{project_id}/files/{file_id}"
+        ))
+        .header("x-api-key", api_key)
+        .send()?
+        .error_for_status()?;
+    Ok(response.json::<CurseForgeFileResponse>()?.data)
+}
+
+fn report_prepare_progress(on_progress: &mut Option<&mut dyn FnMut(String)>, message: String) {
+    if let Some(callback) = on_progress.as_deref_mut() {
+        callback(message);
     }
 }
 
@@ -983,6 +1530,23 @@ fn by_path(files: &[ManifestFile]) -> BTreeMap<String, &ManifestFile> {
     files.iter().map(|file| (file.path.clone(), file)).collect()
 }
 
+fn is_launcher_metadata_file(file: &ManifestFile) -> bool {
+    is_launcher_metadata_path(&file.path)
+        || (file.owner == Owner::Pack
+            && !file.path.contains('/')
+            && file.path.to_ascii_lowercase().ends_with(".json"))
+}
+
+fn single_launcher_metadata_file(files: &[ManifestFile]) -> Option<&ManifestFile> {
+    let mut matches = files.iter().filter(|file| is_launcher_metadata_file(file));
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(first)
+    }
+}
+
 fn is_user_asset(file: &ManifestFile) -> bool {
     let path = file.path.to_ascii_lowercase();
     matches!(
@@ -1049,17 +1613,32 @@ fn review_item(
 fn mod_index(source: &Path, files: &[ManifestFile]) -> BTreeMap<String, ModInfo> {
     let mut mods = BTreeMap::new();
     for file in files.iter().filter(|file| file.file_type == FileType::Mod) {
-        let info = read_source_file(source, &file.path)
-            .ok()
-            .and_then(|bytes| parse_mod_info(&bytes))
-            .unwrap_or_else(|| fallback_mod_info(&file.path));
+        let info =
+            read_mod_info(source, &file.path).unwrap_or_else(|| fallback_mod_info(&file.path));
         mods.insert(file.path.clone(), info);
     }
     mods
 }
 
-fn parse_mod_info(bytes: &[u8]) -> Option<ModInfo> {
-    let mut archive = ZipArchive::new(Cursor::new(bytes)).ok()?;
+fn read_mod_info(source: &Path, relative_path: &str) -> Option<ModInfo> {
+    let direct = resolve_safe(source, relative_path).ok()?;
+    if direct.exists() {
+        return fs::File::open(direct)
+            .ok()
+            .and_then(parse_mod_info_from_reader);
+    }
+
+    let temp_path = transient_mod_info_path(relative_path).ok()?;
+    let result = copy_source_file_verified(source, relative_path, &temp_path, None)
+        .ok()
+        .and_then(|_| fs::File::open(&temp_path).ok())
+        .and_then(parse_mod_info_from_reader);
+    let _ = fs::remove_file(temp_path);
+    result
+}
+
+fn parse_mod_info_from_reader<R: Read + Seek>(reader: R) -> Option<ModInfo> {
+    let mut archive = ZipArchive::new(reader).ok()?;
     let candidates = [
         "fabric.mod.json",
         "quilt.mod.json",
@@ -1157,6 +1736,22 @@ fn fallback_mod_info(path: &str) -> ModInfo {
         name: Some(file_name.to_string()),
         version: None,
     }
+}
+
+fn transient_mod_info_path(relative_path: &str) -> AppResult<PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let file_name = Path::new(relative_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mod.jar");
+    Ok(std::env::temp_dir().join(format!(
+        "kairos-patch-modinfo-{}-{stamp}-{}",
+        std::process::id(),
+        sanitize_path_component(file_name)
+    )))
 }
 
 fn normalize_review_choices(
@@ -1279,6 +1874,43 @@ fn apply_conservative_auto_action(
                 source_path: Some(source_path.to_string()),
             });
         }
+        "replace_version_metadata" => {
+            let source_path = action.target_path.as_deref().ok_or_else(|| {
+                AppError::Message(format!(
+                    "Version metadata replacement is missing target path for {}",
+                    action.path
+                ))
+            })?;
+            let target_file = target_by_path.get(source_path).ok_or_else(|| {
+                AppError::Message(format!(
+                    "Target source does not contain automatic action path: {source_path}"
+                ))
+            })?;
+            if !is_launcher_metadata_file(target_file) {
+                return Err(AppError::Message(format!(
+                    "Refusing to use non-metadata file as launcher metadata: {source_path}"
+                )));
+            }
+            backup_existing_once(
+                instance_dir,
+                backup_id,
+                &action.path,
+                backup_files,
+                touched_paths,
+            )?;
+            copy_source_to_instance_path(
+                target_source,
+                instance_dir,
+                source_path,
+                &action.path,
+                Some(&target_file.sha256),
+            )?;
+            applied_changes.push(ConservativeAppliedChange {
+                path: action.path.clone(),
+                action: action.action.clone(),
+                source_path: Some(source_path.to_string()),
+            });
+        }
         "replace_local_mod_with_target_mod" => {
             let source_path = action.target_path.as_deref().ok_or_else(|| {
                 AppError::Message(format!(
@@ -1349,25 +1981,24 @@ fn copy_source_to_instance(
     relative_path: &str,
     expected_sha: Option<&str>,
 ) -> AppResult<()> {
-    if !source_file_exists(source_root, relative_path)? {
-        return Err(AppError::Message(format!(
-            "Source file does not exist: {} -> {}",
-            source_root.display(),
-            relative_path
-        )));
-    }
-    let content = read_source_file(source_root, relative_path)?;
-    let actual_sha = sha256_bytes(&content);
-    if let Some(expected) = expected_sha {
-        if actual_sha != expected {
-            return Err(AppError::Message(format!(
-                "SHA256 check failed: {relative_path}"
-            )));
-        }
-    }
-    let target = resolve_safe(instance_dir, relative_path)?;
-    ensure_parent(&target)?;
-    fs::write(target, content)?;
+    copy_source_to_instance_path(
+        source_root,
+        instance_dir,
+        relative_path,
+        relative_path,
+        expected_sha,
+    )
+}
+
+fn copy_source_to_instance_path(
+    source_root: &Path,
+    instance_dir: &Path,
+    source_relative_path: &str,
+    target_relative_path: &str,
+    expected_sha: Option<&str>,
+) -> AppResult<()> {
+    let target = resolve_safe(instance_dir, target_relative_path)?;
+    copy_source_file_verified(source_root, source_relative_path, &target, expected_sha)?;
     Ok(())
 }
 
@@ -1378,20 +2009,18 @@ fn save_target_candidate(
     relative_path: &str,
     expected_sha: &str,
 ) -> AppResult<String> {
-    let content = read_source_file(target_source, relative_path)?;
-    if sha256_bytes(&content) != expected_sha {
-        return Err(AppError::Message(format!(
-            "SHA256 check failed: {relative_path}"
-        )));
-    }
     let saved_relative = format!(
         ".packdelta/conservative-candidates/{}/{}.target",
         sanitize_path_component(target_version),
         relative_path
     );
     let destination = resolve_safe(instance_dir, &saved_relative)?;
-    ensure_parent(&destination)?;
-    fs::write(destination, content)?;
+    copy_source_file_verified(
+        target_source,
+        relative_path,
+        &destination,
+        Some(expected_sha),
+    )?;
     Ok(saved_relative)
 }
 
@@ -1468,6 +2097,7 @@ fn sanitize_path_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::sha512_bytes;
     use tempfile::tempdir;
 
     #[test]
@@ -1538,6 +2168,132 @@ mod tests {
                 .iter()
                 .any(|change| change.action == "remove" && change.path == "mods/local-only.jar")
         );
+    }
+
+    #[test]
+    fn conservative_apply_updates_launcher_metadata_without_creating_target_named_json() {
+        let temp = tempdir().unwrap();
+        let instance = temp
+            .path()
+            .join(".minecraft")
+            .join("versions")
+            .join("Old Pack");
+        let target = temp.path().join("New Pack");
+        write_file(&instance, "mods/a.jar", b"same");
+        write_file(&instance, "Old Pack.json", br#"{"id":"old"}"#);
+        write_file(&target, "mods/a.jar", b"same");
+        write_file(&target, "New Pack.json", br#"{"id":"new"}"#);
+
+        let result = apply_conservative_update(
+            instance.display().to_string(),
+            target.display().to_string(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(instance.join("Old Pack.json")).unwrap(),
+            r#"{"id":"new"}"#
+        );
+        assert!(!instance.join("New Pack.json").exists());
+        assert!(result.applied_changes.iter().any(|change| {
+            change.action == "replace_version_metadata"
+                && change.path == "Old Pack.json"
+                && change.source_path.as_deref() == Some("New Pack.json")
+        }));
+        let detail =
+            get_backup_detail(instance.display().to_string(), result.backup_id.unwrap()).unwrap();
+        assert!(detail.operation_files.iter().any(|file| {
+            file.action == "replace_version_metadata" && file.path == "Old Pack.json"
+        }));
+    }
+
+    #[test]
+    fn conservative_preview_materializes_modrinth_manifest_only_target() {
+        let temp = tempdir().unwrap();
+        let instance = temp.path().join("instance");
+        let target = temp.path().join("target");
+        let mod_bytes = b"downloaded-mod";
+        let url = "kairos-test://downloaded-mod";
+        write_file(&instance, "mods/a.jar", b"same");
+        write_file(
+            &target,
+            "modrinth.index.json",
+            format!(
+                r#"{{"formatVersion":1,"files":[{{"path":"mods/b.jar","hashes":{{"sha512":"{}"}},"downloads":["{}"]}}]}}"#,
+                sha512_bytes(mod_bytes),
+                url
+            )
+            .as_bytes(),
+        );
+        write_file(&target, "overrides/config/app.toml", b"target=true\n");
+
+        let plan = preview_conservative_update(
+            instance.display().to_string(),
+            target.display().to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.target_source_kind, SourceKind::CompletePack);
+        assert!(plan.logs.iter().any(|log| log.contains("Modrinth")));
+        assert!(
+            plan.auto_actions
+                .iter()
+                .any(|action| action.path == "mods/b.jar")
+        );
+    }
+
+    #[test]
+    fn conservative_apply_materializes_modrinth_manifest_only_target() {
+        let temp = tempdir().unwrap();
+        let instance = temp.path().join("instance");
+        let target = temp.path().join("target");
+        let mod_bytes = b"downloaded-mod";
+        let url = "kairos-test://downloaded-mod";
+        write_file(&instance, "mods/a.jar", b"same");
+        write_file(
+            &target,
+            "modrinth.index.json",
+            format!(
+                r#"{{"formatVersion":1,"files":[{{"path":"mods/b.jar","hashes":{{"sha512":"{}"}},"downloads":["{}"]}}]}}"#,
+                sha512_bytes(mod_bytes),
+                url
+            )
+            .as_bytes(),
+        );
+
+        let result = apply_conservative_update(
+            instance.display().to_string(),
+            target.display().to_string(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(instance.join("mods/b.jar")).unwrap(), mod_bytes);
+        assert!(result.applied_changes.iter().any(|change| {
+            change.action == "add_missing_target_file" && change.path == "mods/b.jar"
+        }));
+    }
+
+    #[test]
+    fn conservative_preview_requires_curseforge_api_key_for_curseforge_install_zip() {
+        let temp = tempdir().unwrap();
+        let instance = temp.path().join("instance");
+        let target = temp.path().join("target");
+        write_file(&instance, "mods/a.jar", b"same");
+        write_file(
+            &target,
+            "manifest.json",
+            br#"{"manifestType":"minecraftModpack","files":[{"projectID":1,"fileID":2}]}"#,
+        );
+
+        let error = preview_conservative_update(
+            instance.display().to_string(),
+            target.display().to_string(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("KAIROS_CURSEFORGE_API_KEY"));
     }
 
     #[test]
@@ -1653,6 +2409,39 @@ pub fn list_backups(instance_dir: String) -> AppResult<Vec<BackupSummary>> {
     }
     backups.sort_by(|a, b| b.id.cmp(&a.id));
     Ok(backups)
+}
+
+#[tauri::command]
+pub fn get_backup_detail(instance_dir: String, backup_id: String) -> AppResult<BackupDetail> {
+    let manifest = backup::read_backup_manifest(Path::new(&instance_dir), &backup_id)?;
+    let operation_files = if manifest.operation_files.is_empty() {
+        manifest
+            .files
+            .iter()
+            .map(|file| BackupOperationFileView {
+                path: file.path.clone(),
+                action: "backup".to_string(),
+                source_path: None,
+            })
+            .collect()
+    } else {
+        manifest
+            .operation_files
+            .iter()
+            .map(|file| BackupOperationFileView {
+                path: file.path.clone(),
+                action: file.action.clone(),
+                source_path: file.source_path.clone(),
+            })
+            .collect()
+    };
+    Ok(BackupDetail {
+        id: manifest.backup_id,
+        from: manifest.from,
+        to: manifest.to,
+        file_count: manifest.files.len(),
+        operation_files,
+    })
 }
 
 #[tauri::command]

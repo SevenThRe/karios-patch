@@ -61,3 +61,30 @@
 - Fixed beta feedback from video review: completion toasts now stop the loading animation, and no-baseline `config/**` same-path differences default to keep without appearing as hundreds of blocking review choices.
 - Reworked the update page into a compact desktop utility layout: toolbar, inline source fields, split changes list, diff pane, row-level review choices, and a bottom status bar.
 - Verified the split-pane utility UI with `npm run lint`, `npm run build`, and a local browser smoke check at `http://127.0.0.1:5177/`.
+- Fixed version-isolated launcher metadata updates: root version JSON files are now managed when they are known pack metadata or match the selected source folder/ZIP name, and target metadata is written back to the current instance metadata path when the version folder JSON name changes.
+- Added durable operation detail records to backup manifests and exposed `get_backup_detail` so completed updates can be inspected later instead of being treated as a black-box toast.
+- Added an update-page operation history side panel with per-operation detail and rollback controls; detail renders the operation files as a tree, and the main changed-file list now uses the same file-tree presentation.
+- Verified the metadata/history changes with `cargo test`, `npm run build`, `npm run lint`, and a local browser smoke check at `http://127.0.0.1:5173/`.
+- Added source-kind detection for selected pack sources: complete downloaded packs, CurseForge manifest-only packs, Modrinth manifest-only packs, and unknown sources are now distinguished during scan.
+- Added target materialization for manifest-only install ZIPs: Modrinth `modrinth.index.json` dependencies are downloaded from their listed URLs, hash-checked, and written into `.packdelta/materialized/` before preview/apply reuse the normal complete-pack update path.
+- Added CurseForge install ZIP resolution through the official CurseForge API path. CurseForge targets now require `KAIROS_CURSEFORGE_API_KEY` so `projectID/fileID` entries can be resolved to downloadable files before update planning.
+- Added regression tests for complete pack detection, CurseForge manifest-only detection, Modrinth manifest-only detection, Modrinth preview materialization, Modrinth apply materialization, and missing CurseForge API key handling.
+- Re-verified with `cargo fmt`, `cargo test`, `npm run build`, and `npm run lint`.
+- Reduced large-file memory pressure by streaming portable update ZIP extraction from disk, streaming diagnostic package attachments into the zip, and removing redundant source-existence scans before patch writes.
+- Removed the now-unused `source_file_exists` ZIP/directory lookup helper so patch writes do not accidentally reintroduce double source scans.
+- Verified the I/O optimization changes with `cargo fmt --manifest-path src-tauri\Cargo.toml`, `cargo test --manifest-path src-tauri\Cargo.toml`, `npm run lint`, and `npm run build`.
+- Added a process-local ZIP source index cache so repeated reads from the same selected ZIP reuse normalized entry lookup instead of scanning every ZIP entry for each file.
+- Added bounded parallel hashing for non-tracked directory source scans with at least 32 files; tracked scans keep serial hashing so per-file progress remains accurate.
+- Changed app self-update downloads and manifest-only Modrinth/CurseForge dependency downloads to stream into temporary files, verify the downloaded file hash from disk, and rename only after validation.
+- Changed local-directory mod metadata parsing to open jar files directly as ZIP archives instead of reading each full jar into memory before parsing `fabric.mod.json`, `mods.toml`, or `mcmod.info`.
+- Replaced the changed-file tree with fixed-height windowed rendering so large diff/operation-detail lists render only visible rows while preserving the full file list.
+- Re-verified the performance pass with `cargo fmt --manifest-path src-tauri\Cargo.toml`, `cargo test --manifest-path src-tauri\Cargo.toml`, `npm run lint`, `npm run build`, and a local Playwright smoke check at `http://127.0.0.1:5179/`.
+- Removed the general whole-file source reader from update paths. Diff preview now reads only `MAX_PREVIEW_BYTES + 1`, install manifests are capped at 8 MiB, and config auto-merge reads are capped at 2 MiB.
+- Added streaming source-to-destination copy with same-directory temporary files, disk SHA256 validation, and rename-after-validation for patch writes, materialized payload files, and saved target config candidates.
+- Changed source SHA checks to stream from the source file or ZIP entry instead of reading full source bytes into memory.
+- Changed ZIP/normalized fallback mod metadata parsing to stream-copy the jar to a temporary file and parse metadata from disk, avoiding a large heap buffer for nested jar reads.
+- Verified the remaining-boundary cleanup with `cargo fmt --manifest-path src-tauri\Cargo.toml`, `cargo test --manifest-path src-tauri\Cargo.toml`, `npm run lint`, and `npm run build`.
+- Hit a local Windows release-build crash in `rustc` during `npm run tauri:build` with `STATUS_ACCESS_VIOLATION`; lowered the release profile to reduce compiler pressure for the v0.1.2 release build.
+- Verified the v0.1.2 release build after lowering release-profile compiler pressure with `npm run tauri:build`; MSI and NSIS bundles were generated successfully.
+- Built the v0.1.2 portable package with `npm run portable:release`, copied it to `dist-portable/KairosPatch-v0.1.2-portable.zip`, and updated the local release index plus docs with SHA256 `285a6f3e8459b449f6dd9e02915ba783ceeaf5add5d0febbf47d23a7be56352a` and size `3720534`.
+- Triaged the current dirty work into release-hardening, operation-history, frontend, dependency, and maintenance-doc groups in `WORKTREE_TRIAGE.md`; no implementation files were changed by the triage pass.
