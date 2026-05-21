@@ -87,4 +87,5 @@
 - Hit a local Windows release-build crash in `rustc` during `npm run tauri:build` with `STATUS_ACCESS_VIOLATION`; lowered the release profile to reduce compiler pressure for the v0.1.2 release build.
 - Verified the v0.1.2 release build after lowering release-profile compiler pressure with `npm run tauri:build`; MSI and NSIS bundles were generated successfully.
 - Built the v0.1.2 portable package with `npm run portable:release`, copied it to `dist-portable/KairosPatch-v0.1.2-portable.zip`, and updated the local release index plus docs with SHA256 `285a6f3e8459b449f6dd9e02915ba783ceeaf5add5d0febbf47d23a7be56352a` and size `3720534`.
+- Published GitHub Release `v0.1.2` at `https://github.com/SevenThRe/karios-patch/releases/tag/v0.1.2` with the portable zip, SHA256 JSON, release-index JSON, MSI, and NSIS setup assets.
 - Triaged the current dirty work into release-hardening, operation-history, frontend, dependency, and maintenance-doc groups in `WORKTREE_TRIAGE.md`; no implementation files were changed by the triage pass.
