@@ -20,15 +20,6 @@ if (Test-Path $packageDir) {
 New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $packageDir "kairos_patch.exe") -Force
 
-@"
-Kairos Patch Portable
-
-Run kairos_patch.exe directly. No installer is required.
-
-Self-update source:
-Publish release-index.json and KairosPatch-portable.zip as GitHub Release assets.
-"@ | Set-Content -LiteralPath (Join-Path $packageDir "README.txt") -Encoding UTF8
-
 if (Test-Path $zipPath) {
   Remove-Item -LiteralPath $zipPath -Force
 }
