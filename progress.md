@@ -95,3 +95,5 @@
 - Changed the baseline update UI to show actionable current-instance plan files instead of raw old-pack-to-new-pack diff files, and to re-preview after apply so repeated checks no longer show already-applied changes as pending work.
 - Changed operation history counts to use durable operation file records when available, so add-only updates no longer display as `0 files`.
 - Bumped the app release version to `0.1.3` for the hotfix release line and started the v0.1.3 verification/release pass.
+- Verified the v0.1.3 hotfix release with `cargo fmt --manifest-path src-tauri\Cargo.toml`, `cargo test --manifest-path src-tauri\Cargo.toml`, `npm run lint`, `npm run build`, `npm audit --audit-level=moderate`, `npm run tauri:build`, `npm run portable:release`, and `git diff --check`.
+- Published GitHub Release `v0.1.3` at `https://github.com/SevenThRe/karios-patch/releases/tag/v0.1.3` with portable zip SHA256 `ce61d35b161bcf6a299b84f2b461f3fb40f01cba298a83f2d40b45bd6bebf917`, release-index latest `0.1.3`, MSI, and NSIS assets.
