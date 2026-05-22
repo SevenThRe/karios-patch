@@ -89,3 +89,9 @@
 - Built the v0.1.2 portable package with `npm run portable:release`, copied it to `dist-portable/KairosPatch-v0.1.2-portable.zip`, and updated the local release index plus docs with SHA256 `285a6f3e8459b449f6dd9e02915ba783ceeaf5add5d0febbf47d23a7be56352a` and size `3720534`.
 - Published GitHub Release `v0.1.2` at `https://github.com/SevenThRe/karios-patch/releases/tag/v0.1.2` with the portable zip, SHA256 JSON, release-index JSON, MSI, and NSIS setup assets.
 - Triaged the current dirty work into release-hardening, operation-history, frontend, dependency, and maintenance-doc groups in `WORKTREE_TRIAGE.md`; no implementation files were changed by the triage pass.
+- Fixed portable hot-update installation for v0.1.3 by renaming the PowerShell install script process parameter from reserved `$Pid` to `$AppPid`.
+- Added no-baseline CurseForge overrides-only import for users who select a CurseForge export ZIP/folder without `KAIROS_CURSEFORGE_API_KEY`; only `overrides/` payload files are applied and manifest mod dependencies are left local/reviewed.
+- Added post-write verification for baseline apply actions so missing files, stale renamed files, failed removals, or SHA mismatches fail the operation instead of reporting `Update completed`.
+- Changed the baseline update UI to show actionable current-instance plan files instead of raw old-pack-to-new-pack diff files, and to re-preview after apply so repeated checks no longer show already-applied changes as pending work.
+- Changed operation history counts to use durable operation file records when available, so add-only updates no longer display as `0 files`.
+- Bumped the app release version to `0.1.3` for the hotfix release line and started the v0.1.3 verification/release pass.

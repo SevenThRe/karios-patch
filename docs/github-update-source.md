@@ -12,8 +12,8 @@ Recommended release assets:
 
 ```text
 release-index.json
-KairosPatch-v0.1.2-portable.zip
-KairosPatch-v0.1.2-portable.zip.sha256.json
+KairosPatch-v0.1.3-portable.zip
+KairosPatch-v0.1.3-portable.zip.sha256.json
 ```
 
 `release-index.json`:
@@ -21,16 +21,16 @@ KairosPatch-v0.1.2-portable.zip.sha256.json
 ```json
 {
   "app_id": "kairos-patch",
-  "latest": "0.1.2",
+  "latest": "0.1.3",
   "releases": [
     {
-      "version": "0.1.2",
-      "notes": "Adds manifest-only pack materialization, safer no-baseline update execution, operation history details, bounded large-file handling, streaming copy/download paths, and virtualized large file trees.",
-      "published_at": "2026-05-21T14:45:14Z",
+      "version": "0.1.3",
+      "notes": "Fixes portable hot-update installation, supports CurseForge overrides-only ZIP imports in no-baseline mode, verifies writes before reporting completion, and refreshes the actionable update plan after apply.",
+      "published_at": "2026-05-22T01:03:06Z",
       "portable": {
-        "url": "https://github.com/SevenThRe/karios-patch/releases/download/v0.1.2/KairosPatch-v0.1.2-portable.zip",
-        "sha256": "285a6f3e8459b449f6dd9e02915ba783ceeaf5add5d0febbf47d23a7be56352a",
-        "size": 3720534
+        "url": "https://github.com/SevenThRe/karios-patch/releases/download/v0.1.3/KairosPatch-v0.1.3-portable.zip",
+        "sha256": "ce61d35b161bcf6a299b84f2b461f3fb40f01cba298a83f2d40b45bd6bebf917",
+        "size": 3715331
       }
     }
   ]

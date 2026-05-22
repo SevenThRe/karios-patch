@@ -255,7 +255,7 @@ pub fn prepare_portable_install(
         .arg("Bypass")
         .arg("-File")
         .arg(&script_path)
-        .arg("-Pid")
+        .arg("-AppPid")
         .arg(std::process::id().to_string());
     hide_command_window(&mut command);
     command.spawn()?;
@@ -458,13 +458,13 @@ fn write_install_script(
     }
     let script = format!(
         r#"
-param([int]$Pid)
+param([int]$AppPid)
 $ErrorActionPreference = "Stop"
 $staging = "{staging}"
 $appDir = "{app_dir}"
 $exe = "{exe}"
-if ($Pid -gt 0) {{
-  Wait-Process -Id $Pid -ErrorAction SilentlyContinue
+if ($AppPid -gt 0) {{
+  Wait-Process -Id $AppPid -ErrorAction SilentlyContinue
 }}
 Start-Sleep -Milliseconds 500
 Copy-Item -Path (Join-Path $staging '*') -Destination $appDir -Recurse -Force
@@ -574,5 +574,21 @@ mod tests {
         release.portable.sha256 = "not-a-sha".to_string();
 
         assert!(normalize_release(release).is_err());
+    }
+
+    #[test]
+    fn install_script_uses_non_reserved_process_parameter() {
+        let temp = tempfile::tempdir().unwrap();
+        let script_path = temp.path().join("apply.ps1");
+        let staging_dir = temp.path().join("staged");
+        let app_dir = temp.path().join("app");
+        let exe_path = app_dir.join("kairos_patch.exe");
+
+        write_install_script(&script_path, &staging_dir, &app_dir, &exe_path).unwrap();
+
+        let script = fs::read_to_string(script_path).unwrap();
+        assert!(script.contains("param([int]$AppPid)"));
+        assert!(script.contains("Wait-Process -Id $AppPid"));
+        assert!(!script.contains("param([int]$Pid)"));
     }
 }

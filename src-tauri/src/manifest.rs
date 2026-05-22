@@ -85,6 +85,7 @@ pub enum FileType {
 pub enum SourceKind {
     CompletePack,
     CurseForgeManifestOnly,
+    CurseForgeOverridesOnly,
     ModrinthManifestOnly,
     Unknown,
 }

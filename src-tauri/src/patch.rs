@@ -506,6 +506,7 @@ pub fn apply_update_with_progress(
         &new_manifest.version,
         &plan,
     )?;
+    verify_applied_plan(instance_dir, &plan)?;
 
     write_manifest(
         &instance_dir
@@ -642,6 +643,63 @@ fn operation_files_from_plan(plan: &UpdatePlan) -> Vec<backup::BackupOperationFi
             .then(left.action.cmp(&right.action))
     });
     files
+}
+
+fn verify_applied_plan(instance_dir: &Path, plan: &UpdatePlan) -> AppResult<()> {
+    for action in plan.added.iter().chain(plan.updated.iter()) {
+        verify_expected_file(instance_dir, &action.path, action.sha256.as_deref())?;
+    }
+    for action in &plan.renamed {
+        verify_expected_file(instance_dir, &action.to, Some(&action.sha256))?;
+        let old_target = resolve_safe(instance_dir, &action.from)?;
+        if old_target.exists() {
+            return Err(AppError::Message(format!(
+                "更新后校验失败，旧文件仍然存在: {}",
+                action.from
+            )));
+        }
+    }
+    for action in &plan.removed {
+        let target = resolve_safe(instance_dir, &action.path)?;
+        if target.exists() {
+            return Err(AppError::Message(format!(
+                "更新后校验失败，文件仍然存在: {}",
+                action.path
+            )));
+        }
+    }
+    for action in &plan.merged {
+        let target = resolve_safe(instance_dir, &action.path)?;
+        if !target.exists() {
+            return Err(AppError::Message(format!(
+                "更新后校验失败，合并文件不存在: {}",
+                action.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_expected_file(
+    instance_dir: &Path,
+    relative_path: &str,
+    expected_sha: Option<&str>,
+) -> AppResult<()> {
+    let target = resolve_safe(instance_dir, relative_path)?;
+    if !target.exists() {
+        return Err(AppError::Message(format!(
+            "更新后校验失败，文件未写入: {relative_path}"
+        )));
+    }
+    if let Some(expected) = expected_sha {
+        let actual = sha256_file(&target)?;
+        if actual != expected {
+            return Err(AppError::Message(format!(
+                "更新后校验失败，文件 SHA256 不一致: {relative_path}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn rollback(instance_dir: &Path, backup_id: &str) -> AppResult<RollbackResult> {

@@ -45,3 +45,7 @@
 - The primary user flow for this release line is current instance plus a new complete downloaded target pack. Most users will not retain an old official pack, so old-baseline mode remains advanced rather than required.
 - Manifest-only install ZIPs must be materialized before update planning. Modrinth can be materialized from `modrinth.index.json` download URLs and hashes; CurseForge must use an explicit `KAIROS_CURSEFORGE_API_KEY` to resolve `projectID/fileID` through the official API.
 - Store materialized target packs under `.packdelta/materialized/<manifest-digest>/` and rescan that cache as a normal complete pack before comparing or applying updates.
+- Baseline precision mode must not fall back from CurseForge manifest-only sources to overrides-only payloads, because that can make remote mod dependencies look deleted or absent. It still requires a full target pack or `KAIROS_CURSEFORGE_API_KEY`.
+- No-baseline conservative mode may import CurseForge `overrides/` without resolving manifest mod dependencies. The resulting source kind is `CurseForgeOverridesOnly`, and only override files are applied while local mods remain protected or reviewable.
+- A completed baseline apply must be verified against the filesystem before state is written. Success means planned writes/removals are observable on disk, not only that copy calls returned.
+- The update page should present actionable current-instance changes when a plan exists. Raw old-source to target-source diff is useful for preview context only when no plan is available.

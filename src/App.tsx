@@ -87,7 +87,7 @@ type PackManifest = {
   pack_id: string
   pack_name: string
   version: string
-  source_kind: 'complete_pack' | 'curse_forge_manifest_only' | 'modrinth_manifest_only' | 'unknown'
+  source_kind: 'complete_pack' | 'curse_forge_manifest_only' | 'curse_forge_overrides_only' | 'modrinth_manifest_only' | 'unknown'
   created_at: string
   files: ManifestFile[]
 }
@@ -549,17 +549,24 @@ function buildFileTreeEntries(files: DiffFileCandidate[]): FileTreeEntry[] {
 const TREE_ROW_HEIGHT = 34
 const TREE_OVERSCAN_ROWS = 8
 
-function isCompletePack(kind?: PackManifest['source_kind']) {
-  return kind === 'complete_pack'
+function isApplicableTarget(kind: PackManifest['source_kind'] | undefined, hasBaseline: boolean) {
+  if (kind === 'complete_pack') return true
+  return !hasBaseline && kind === 'curse_forge_overrides_only'
 }
 
 function sourceKindWarning(kind?: PackManifest['source_kind'], locale: Locale = 'zh') {
   if (!kind || kind === 'complete_pack') return ''
   const names = {
     curse_forge_manifest_only: 'CurseForge manifest-only',
+    curse_forge_overrides_only: 'CurseForge overrides-only',
     modrinth_manifest_only: 'Modrinth manifest-only',
     unknown: locale === 'zh' ? '未确认完整包' : 'unknown source',
   } satisfies Record<Exclude<PackManifest['source_kind'], 'complete_pack'>, string>
+  if (kind === 'curse_forge_overrides_only') {
+    return locale === 'zh'
+      ? '已按 CurseForge overrides-only 导入：只会应用 overrides 中的文件，不会下载 manifest 里的 mod jar；本地 mods 会保留或列入确认。'
+      : 'Imported as CurseForge overrides-only. Only override files can be applied; manifest mod jars are not downloaded, and local mods are kept or listed for review.'
+  }
   const name = names[kind]
   return locale === 'zh'
     ? `已识别为 ${name}，可以检测内容，但不能直接执行更新；请先用启动器导入并下载完整 mods jar。`
@@ -608,11 +615,11 @@ function App() {
   const baselineHasWork = Boolean(plan && (plan.added.length || plan.updated.length || plan.removed.length || plan.merged.length || plan.renamed.length))
   const conservativeHasWork = Boolean(conservativePlan && (
     conservativePlan.auto_actions.length ||
-    blockingReviewItems.some((item) => (reviewChoices[item.id] ?? item.default_choice) !== item.default_choice)
+    conservativePlan.review_items.some((item) => (reviewChoices[item.id] ?? item.default_choice) !== item.default_choice)
   ))
   const canApply = Boolean(canCheck && (
-    (hasBaseline && plan && isCompletePack(plan.target_source_kind) && !plan.conflicts.length && baselineHasWork) ||
-    (!hasBaseline && conservativePlan && isCompletePack(conservativePlan.target_source_kind) && conservativeHasWork)
+    (hasBaseline && plan && isApplicableTarget(plan.target_source_kind, true) && !plan.conflicts.length && baselineHasWork) ||
+    (!hasBaseline && conservativePlan && isApplicableTarget(conservativePlan.target_source_kind, false) && conservativeHasWork)
   ))
   const currentPatchVersion = conservativePlan?.target_version ?? plan?.to ?? appUpdate?.latest_version ?? appVersion
 
@@ -627,16 +634,19 @@ function App() {
 
   const diffFiles = useMemo<DiffFileCandidate[]>(() => {
     const candidates: DiffFileCandidate[] = []
-    if (compareResult) {
+    if (plan) {
+      candidates.push(...plan.updated.map((item) => ({ path: item.path, label: item.source_path && item.source_path !== item.path ? `${t.updated}: ${item.source_path}` : t.updated, tone: 'updated' as const })))
+      candidates.push(...plan.added.map((item) => ({ path: item.path, label: item.source_path && item.source_path !== item.path ? `${t.added}: ${item.source_path}` : t.added, tone: 'added' as const })))
+      candidates.push(...plan.removed.map((item) => ({ path: item.path, label: t.removed, tone: 'removed' as const })))
+      candidates.push(...plan.renamed.map((item) => ({ path: item.to, label: `${item.from} -> ${item.to}`, tone: 'updated' as const })))
+      candidates.push(...plan.merged.map((item) => ({ path: item.path, label: t.updated, tone: 'updated' as const })))
+      candidates.push(...plan.conflicts.map((item) => ({ path: item.path, label: item.reason, tone: 'conflict' as const })))
+      candidates.push(...plan.preserved.map((path) => ({ path, label: t.protected, tone: 'protected' as const })))
+    } else if (compareResult) {
       candidates.push(...compareResult.diff.updated.map((item) => ({ path: item.new.path, label: t.updated, tone: 'updated' as const })))
       candidates.push(...compareResult.diff.added.map((item) => ({ path: item.path, label: t.added, tone: 'added' as const })))
       candidates.push(...compareResult.diff.removed.map((item) => ({ path: item.path, label: t.removed, tone: 'removed' as const })))
       candidates.push(...compareResult.diff.renamed.map((item) => ({ path: item.new.path, label: `${item.old.path} -> ${item.new.path}`, tone: 'updated' as const })))
-    }
-    if (plan) {
-      candidates.push(...plan.merged.map((item) => ({ path: item.path, label: t.updated, tone: 'updated' as const })))
-      candidates.push(...plan.conflicts.map((item) => ({ path: item.path, label: item.reason, tone: 'conflict' as const })))
-      candidates.push(...plan.preserved.map((path) => ({ path, label: t.protected, tone: 'protected' as const })))
     }
     if (conservativePlan) {
       candidates.push(...conservativePlan.auto_actions.map((item) => ({ path: item.path, label: item.reason, tone: 'updated' as const })))
@@ -841,9 +851,16 @@ function App() {
       if (hasBaseline) {
         const result = await invoke<ApplyResult>('apply_update_tracked', { operationId, instanceDir, oldSource, newSource })
         setLastLogs(result.logs)
-        setPlan(result.plan)
+        const nextPlan = await invoke<UpdatePlan>('preview_update', { instanceDir, oldSource, newSource })
+        setPlan(nextPlan)
         if (result.backup_id) await loadBackupDetail(result.backup_id, true)
-        setMessage(result.backup_id ? `${locale === 'zh' ? '更新完成，备份 ID' : 'Update complete. Backup ID'}: ${result.backup_id}` : locale === 'zh' ? '无需写入，已经是目标版本。' : 'No writes needed. Already at target version.')
+        const refreshedHasWork = nextPlan.added.length || nextPlan.updated.length || nextPlan.removed.length || nextPlan.merged.length || nextPlan.renamed.length
+        setMessage(result.backup_id
+          ? `${locale === 'zh' ? '更新完成，已重新检查当前实例。备份 ID' : 'Update complete and current instance was rechecked. Backup ID'}: ${result.backup_id}`
+          : locale === 'zh' ? '无需写入，已经是目标版本。' : 'No writes needed. Already at target version.')
+        if (refreshedHasWork) {
+          recordAppLog('warn', 'Baseline update apply left actionable differences after recheck', `${refreshedHasWork} actions`)
+        }
         recordAppLog('info', 'Baseline update apply completed', result.backup_id ?? 'no backup')
       } else {
         const result = await invoke<ConservativeApplyResult>('apply_conservative_update_tracked', {

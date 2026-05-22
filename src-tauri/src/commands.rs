@@ -170,6 +170,7 @@ struct ModInfo {
     version: Option<String>,
 }
 
+#[derive(Debug)]
 struct PreparedSource {
     path: PathBuf,
     manifest: PackManifest,
@@ -341,6 +342,7 @@ fn preview_conservative_update_with_progress(
         Path::new(&instance_dir),
         Path::new(&target_source),
         target,
+        true,
         Some(&mut |message| {
             if let Some(callback) = on_progress.as_deref_mut() {
                 callback(
@@ -575,6 +577,7 @@ pub fn preview_update(
         Path::new(&instance_dir),
         Path::new(&new_source),
         new_manifest,
+        false,
         None,
     )?;
     let new_source_path = prepared_new.path;
@@ -612,6 +615,7 @@ pub fn apply_update(
         Path::new(&instance_dir),
         Path::new(&new_source),
         new_manifest,
+        false,
         None,
     )?;
     patch::apply_update(
@@ -666,6 +670,7 @@ pub fn apply_update_tracked(
         Path::new(&instance_dir),
         Path::new(&new_source),
         new_manifest,
+        false,
         Some(&mut |message| {
             emit_operation_progress(
                 &app,
@@ -824,6 +829,7 @@ fn apply_conservative_update_inner(
         instance_dir,
         target_source,
         target,
+        true,
         Some(&mut |message| {
             report_conservative_progress(&mut on_progress, "preparing", message, 0, 1, None);
         }),
@@ -1111,10 +1117,11 @@ fn prepare_target_source(
     instance_dir: &Path,
     target_source: &Path,
     manifest: PackManifest,
+    allow_overrides_only_fallback: bool,
     mut on_progress: Option<&mut dyn FnMut(String)>,
 ) -> AppResult<PreparedSource> {
     match manifest.source_kind {
-        SourceKind::CompletePack => Ok(PreparedSource {
+        SourceKind::CompletePack | SourceKind::CurseForgeOverridesOnly => Ok(PreparedSource {
             path: target_source.to_path_buf(),
             manifest,
             logs: Vec::new(),
@@ -1123,7 +1130,13 @@ fn prepare_target_source(
             materialize_modrinth_source(instance_dir, target_source, manifest, &mut on_progress)
         }
         SourceKind::CurseForgeManifestOnly => {
-            materialize_curseforge_source(instance_dir, target_source, manifest, &mut on_progress)
+            materialize_curseforge_source(
+                instance_dir,
+                target_source,
+                manifest,
+                allow_overrides_only_fallback,
+                &mut on_progress,
+            )
         }
         SourceKind::Unknown => Err(AppError::Message(
             "无法确认目标源是 Minecraft 整合包：未发现 mods/*.jar，也未能识别为 CurseForge/Modrinth 安装包。".to_string(),
@@ -1193,12 +1206,25 @@ fn materialize_curseforge_source(
     instance_dir: &Path,
     target_source: &Path,
     manifest: PackManifest,
+    allow_overrides_only_fallback: bool,
     on_progress: &mut Option<&mut dyn FnMut(String)>,
 ) -> AppResult<PreparedSource> {
-    let api_key = std::env::var("KAIROS_CURSEFORGE_API_KEY")
-        .map_err(|_| AppError::Message(
-            "目标整合包是 CurseForge 安装 ZIP。需要设置 KAIROS_CURSEFORGE_API_KEY 后才能根据 projectID/fileID 下载 mod jar。".to_string(),
-        ))?;
+    let api_key = match std::env::var("KAIROS_CURSEFORGE_API_KEY") {
+        Ok(value) => value,
+        Err(_) if allow_overrides_only_fallback => {
+            return materialize_curseforge_overrides_source(
+                instance_dir,
+                target_source,
+                manifest,
+                on_progress,
+            );
+        }
+        Err(_) => {
+            return Err(AppError::Message(
+                "目标整合包是 CurseForge 安装 ZIP。需要设置 KAIROS_CURSEFORGE_API_KEY 后才能根据 projectID/fileID 下载 mod jar。".to_string(),
+            ));
+        }
+    };
     report_prepare_progress(on_progress, "Parsing CurseForge manifest".to_string());
     let curseforge: CurseForgeManifest =
         serde_json::from_slice(&read_install_manifest(target_source, "manifest.json")?)?;
@@ -1260,6 +1286,41 @@ fn materialize_curseforge_source(
     })
 }
 
+fn materialize_curseforge_overrides_source(
+    instance_dir: &Path,
+    target_source: &Path,
+    manifest: PackManifest,
+    on_progress: &mut Option<&mut dyn FnMut(String)>,
+) -> AppResult<PreparedSource> {
+    report_prepare_progress(
+        on_progress,
+        "Importing CurseForge overrides without downloading mod jar dependencies".to_string(),
+    );
+    let root = materialized_root(instance_dir, &manifest)?;
+    reset_materialized_root(&root)?;
+    copy_manifest_payload_files(target_source, &root, &manifest)?;
+    let mut prepared_manifest = scan_source(
+        &root,
+        Some(manifest.pack_id.clone()),
+        Some(manifest.pack_name.clone()),
+        Some(manifest.version.clone()),
+    )?;
+    if prepared_manifest.files.is_empty() {
+        return Err(AppError::Message(
+            "这个 CurseForge ZIP 只有 manifest 索引，没有 overrides 文件；请先用启动器导入下载完整包，或设置 KAIROS_CURSEFORGE_API_KEY。".to_string(),
+        ));
+    }
+    prepared_manifest.source_kind = SourceKind::CurseForgeOverridesOnly;
+    Ok(PreparedSource {
+        path: root,
+        manifest: prepared_manifest,
+        logs: vec![
+            "Imported CurseForge overrides only because KAIROS_CURSEFORGE_API_KEY is not configured.".to_string(),
+            "Mod jar dependencies were not downloaded; local mods are kept or shown for review.".to_string(),
+        ],
+    })
+}
+
 fn materialized_root(instance_dir: &Path, manifest: &PackManifest) -> AppResult<PathBuf> {
     Ok(instance_dir
         .join(".packdelta")
@@ -1307,6 +1368,9 @@ fn copy_manifest_payload_files(
         if matches!(file.path.as_str(), "manifest.json" | "modrinth.index.json") {
             continue;
         }
+        if file.owner == Owner::Ignored {
+            continue;
+        }
         if file.file_type == FileType::Mod {
             continue;
         }
@@ -1329,7 +1393,7 @@ fn read_install_manifest(source: &Path, relative_path: &str) -> AppResult<Vec<u8
 fn download_client() -> AppResult<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(120))
-        .user_agent("KairosPatch/0.1.2")
+        .user_agent("KairosPatch/0.1.3")
         .build()?)
 }
 
@@ -2276,7 +2340,7 @@ mod tests {
     }
 
     #[test]
-    fn conservative_preview_requires_curseforge_api_key_for_curseforge_install_zip() {
+    fn baseline_prepare_requires_curseforge_api_key_for_curseforge_install_zip() {
         let temp = tempdir().unwrap();
         let instance = temp.path().join("instance");
         let target = temp.path().join("target");
@@ -2287,13 +2351,71 @@ mod tests {
             br#"{"manifestType":"minecraftModpack","files":[{"projectID":1,"fileID":2}]}"#,
         );
 
+        unsafe {
+            std::env::remove_var("KAIROS_CURSEFORGE_API_KEY");
+        }
+        let manifest = scan_source(&target, None, None, Some("target-local".to_string())).unwrap();
+        let error = prepare_target_source(&instance, &target, manifest, false, None).unwrap_err();
+
+        assert!(error.to_string().contains("KAIROS_CURSEFORGE_API_KEY"));
+    }
+
+    #[test]
+    fn conservative_preview_imports_curseforge_overrides_without_api_key() {
+        let temp = tempdir().unwrap();
+        let instance = temp.path().join("instance");
+        let target = temp.path().join("target");
+        write_file(&instance, "mods/a.jar", b"same");
+        write_file(
+            &target,
+            "manifest.json",
+            br#"{"manifestType":"minecraftModpack","files":[{"projectID":1,"fileID":2}]}"#,
+        );
+        write_file(&target, "overrides/config/app.toml", b"target=true\n");
+
+        unsafe {
+            std::env::remove_var("KAIROS_CURSEFORGE_API_KEY");
+        }
+        let plan = preview_conservative_update(
+            instance.display().to_string(),
+            target.display().to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.target_source_kind, SourceKind::CurseForgeOverridesOnly);
+        assert!(plan.logs.iter().any(|log| log.contains("overrides only")));
+        assert!(plan.auto_actions.iter().any(|action| {
+            action.action == "add_missing_target_file" && action.path == "config/app.toml"
+        }));
+        assert!(
+            plan.review_items
+                .iter()
+                .any(|item| item.path == "mods/a.jar")
+        );
+    }
+
+    #[test]
+    fn conservative_preview_rejects_empty_curseforge_manifest_only_zip_without_api_key() {
+        let temp = tempdir().unwrap();
+        let instance = temp.path().join("instance");
+        let target = temp.path().join("target");
+        write_file(&instance, "mods/a.jar", b"same");
+        write_file(
+            &target,
+            "manifest.json",
+            br#"{"manifestType":"minecraftModpack","files":[{"projectID":1,"fileID":2}]}"#,
+        );
+
+        unsafe {
+            std::env::remove_var("KAIROS_CURSEFORGE_API_KEY");
+        }
         let error = preview_conservative_update(
             instance.display().to_string(),
             target.display().to_string(),
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("KAIROS_CURSEFORGE_API_KEY"));
+        assert!(error.to_string().contains("只有 manifest 索引"));
     }
 
     #[test]
@@ -2400,11 +2522,12 @@ pub fn list_backups(instance_dir: String) -> AppResult<Vec<BackupSummary>> {
         }
         let id = entry.file_name().to_string_lossy().to_string();
         let manifest = backup::read_backup_manifest(Path::new(&instance_dir), &id)?;
+        let file_count = visible_operation_count(&manifest);
         backups.push(BackupSummary {
             id,
             from: manifest.from,
             to: manifest.to,
-            file_count: manifest.files.len(),
+            file_count,
         });
     }
     backups.sort_by(|a, b| b.id.cmp(&a.id));
@@ -2414,7 +2537,7 @@ pub fn list_backups(instance_dir: String) -> AppResult<Vec<BackupSummary>> {
 #[tauri::command]
 pub fn get_backup_detail(instance_dir: String, backup_id: String) -> AppResult<BackupDetail> {
     let manifest = backup::read_backup_manifest(Path::new(&instance_dir), &backup_id)?;
-    let operation_files = if manifest.operation_files.is_empty() {
+    let operation_files: Vec<BackupOperationFileView> = if manifest.operation_files.is_empty() {
         manifest
             .files
             .iter()
@@ -2439,9 +2562,17 @@ pub fn get_backup_detail(instance_dir: String, backup_id: String) -> AppResult<B
         id: manifest.backup_id,
         from: manifest.from,
         to: manifest.to,
-        file_count: manifest.files.len(),
+        file_count: operation_files.len(),
         operation_files,
     })
+}
+
+fn visible_operation_count(manifest: &backup::BackupManifest) -> usize {
+    if manifest.operation_files.is_empty() {
+        manifest.files.len()
+    } else {
+        manifest.operation_files.len()
+    }
 }
 
 #[tauri::command]
